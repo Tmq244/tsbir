@@ -1,0 +1,72 @@
+experiment:
+  name: taskformer_coco_official_finetune
+  seed: 2026
+  output_dir: outputs/taskformer_coco_official_finetune
+
+data:
+  root: data
+  train_manifest: data/processed/manifests/train.jsonl
+  val_manifest: data/processed/manifests/val.jsonl
+  test_manifest: data/processed/manifests/test.jsonl
+  caption_sampling: all
+  train_pairs_per_epoch: 566747
+  image_size: 224
+  workers_per_gpu: 6
+
+model:
+  architecture: ViT-B-16
+  embed_dim: 512
+  weight_sharing: true
+  feature_fusion: avg
+  normalize_fused_query: true
+  num_classes: 90
+  decoder_depth: 6
+  decoder_heads: 8
+  decoder_max_length: 77
+  init: official_taskformer
+  checkpoint: model/tsbir_model_final.pt
+  load_optimizer: false
+
+loss:
+  contrastive_weight: 100.0
+  classification_weight: 10.0
+  decoder_weight: 1.0
+  asl_gamma_negative: 4.0
+  asl_gamma_positive: 1.0
+  asl_clip: 0.05
+  gather_contrastive_features: true
+
+train:
+  epochs: 2
+  batch_size_per_gpu: 48
+  oom_fallback_batch_size_per_gpu: 32
+  expected_world_size: 2
+  global_batch_size: 96
+  effective_batch_size: 192
+  oom_fallback_global_batch_size: 64
+  oom_fallback_effective_batch_size: 128
+  eval_batch_size_per_gpu: 128
+  gradient_accumulation_steps: 2
+  precision: bf16
+  gradient_checkpointing: true
+  gradient_clip_norm: 1.0
+  optimizer: adamw
+  learning_rate: 1.0e-6
+  min_learning_rate: 1.0e-7
+  warmup_steps: 100
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.98
+  eps: 1.0e-6
+  scheduler: cosine
+  save_last: true
+  save_epoch_weights: true
+  selection_metric: last_epoch
+
+distributed:
+  enabled: true
+  backend: nccl
+  devices: [1, 5]
+  nproc_per_node: 2
+  find_unused_parameters: false
+  broadcast_buffers: false

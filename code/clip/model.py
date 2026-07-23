@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
+from x_transformers import AutoregressiveWrapper, Decoder, TransformerWrapper
 
 
 class Bottleneck(nn.Module):
@@ -196,8 +198,13 @@ class Transformer(nn.Module):
         self.width = width
         self.layers = layers
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.grad_checkpointing = False
 
     def forward(self, x: torch.Tensor):
+        if self.grad_checkpointing and self.training:
+            for block in self.resblocks:
+                x = checkpoint(block, x, use_reentrant=False)
+            return x
         return self.resblocks(x)
 
 
@@ -254,7 +261,8 @@ class CLIP(nn.Module):
                  
                  weight_sharing: bool = False,
                  feature_fusion: str = 'avg',
-                 num_class: int = 90
+                 num_class: int = 90,
+                 normalize_fused_query: bool = True
                  ):
         super().__init__()
         #set default to weight sharing
@@ -263,6 +271,7 @@ class CLIP(nn.Module):
             
         self.weight_sharing = weight_sharing
         self.feature_fusion = feature_fusion
+        self.normalize_fused_query = normalize_fused_query
         self.context_length = context_length
 
         if isinstance(vision_layers, (tuple, list)):
@@ -322,6 +331,24 @@ class CLIP(nn.Module):
         
         
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+        # Auxiliary heads used by TASK-former during training.  The decoder
+        # definition intentionally matches x-transformers 0.20.5, which was
+        # the version used to create the public checkpoint.
+        self.decoder = AutoregressiveWrapper(
+            TransformerWrapper(
+                num_tokens=vocab_size,
+                max_seq_len=context_length,
+                attn_layers=Decoder(
+                    dim=embed_dim,
+                    depth=6,
+                    heads=8,
+                    cross_attend=True,
+                ),
+            )
+        )
+        self.classification_fc_1 = nn.Linear(embed_dim, 1024)
+        self.classification_fc_2 = nn.Linear(1024, num_class)
         
         self.initialize_parameters()
 
@@ -380,6 +407,11 @@ class CLIP(nn.Module):
         return self.visual.conv1.weight.dtype
     def decode(self,caption, encode):
         return self.decoder(caption,context=encode)
+    def classify(self, features):
+        return self.classification_fc_2(F.relu(self.classification_fc_1(features)))
+    def set_grad_checkpointing(self, enabled=True):
+        self.transformer.grad_checkpointing = enabled
+        self.visual.transformer.grad_checkpointing = enabled
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
     def encode_sketch(self, image):
@@ -413,7 +445,7 @@ class CLIP(nn.Module):
                 param.requires_grad = True
                 
         return
-    def forward(self, image, text, sketch):
+    def forward(self, image, text, sketch, return_all_features=False):
        
         image_features = self.encode_image(image)
         text_features = self.encode_text(text)
@@ -422,6 +454,9 @@ class CLIP(nn.Module):
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         sketch_features = sketch_features / sketch_features.norm(dim=-1, keepdim=True)
+
+        if return_all_features:
+            return image_features, text_features, sketch_features
         
         fused_feature = self.feature_fuse(text_features,sketch_features)
         
@@ -433,6 +468,8 @@ class CLIP(nn.Module):
             fused_features = (text_features + sketch_features)/2
         else:
             raise Exception(f'Mode {self.feature_fusion} not yet supported')
+        if self.normalize_fused_query:
+            fused_features = F.normalize(fused_features, dim=-1)
         return fused_features
     
 def convert_weights(model: nn.Module):

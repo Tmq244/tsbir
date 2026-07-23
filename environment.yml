@@ -1,0 +1,29 @@
+name: tsbir
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch=2.5.1
+  - torchvision=0.20.1
+  - pytorch-cuda=12.1
+  - numpy<2
+  - pillow
+  - pyyaml
+  - tqdm
+  - pandas
+  - matplotlib
+  - scikit-learn
+  - tensorboard
+  - pytest
+  - pip:
+      - einops>=0.3
+      - entmax
+      - ftfy>=6.1
+      - gdown>=5.0
+      - opencv-python-headless==4.11.0.86
+      - pycocotools>=2.0.7
+      - regex
+      - x-transformers==0.20.5
