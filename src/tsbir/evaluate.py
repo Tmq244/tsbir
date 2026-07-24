@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, Dataset
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -112,43 +112,89 @@ def metrics(ranks: list[int]) -> dict[str, float | int]:
     }
 
 
-def text_tile(text: str, size: int = 256) -> Image.Image:
+def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    path = Path("/usr/share/fonts/truetype/dejavu") / name
+    try:
+        return ImageFont.truetype(str(path), size=size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def text_tile(text: str, size: int = 288) -> Image.Image:
     tile = Image.new("RGB", (size, size), "white")
     draw = ImageDraw.Draw(tile)
-    lines = textwrap.wrap(text or "[empty text]", width=30)
-    draw.multiline_text((12, 12), "\n".join(lines[:12]), fill="black", spacing=5)
+    body_font = load_font(25)
+    lines = textwrap.wrap(text or "[empty text]", width=20)
+    draw.multiline_text(
+        (22, 22), "\n".join(lines[:8]), fill="#111111", font=body_font, spacing=10
+    )
     return tile
 
 
-def case_grid(row: dict[str, Any], records: list[dict[str, Any]], output: Path) -> None:
+def case_grid(
+    row: dict[str, Any],
+    records: list[dict[str, Any]],
+    output: Path,
+    sketch_field: str = "human_sketch",
+) -> None:
+    tile_size = 288
+    margin = 24
+    gap = 16
+    header_height = 148
     mode = row["mode"]
     target_id = int(row["coco_id"])
     if mode == "text":
-        query_tile = text_tile(row["caption"])
+        query_tile = text_tile(row["caption"], tile_size)
     else:
         target_record = records[row["record_index"]]
-        query_tile = Image.open(target_record["human_sketch"]).convert("RGB").resize((256, 256))
+        with Image.open(target_record[sketch_field]) as image:
+            query_tile = image.convert("RGB").resize((tile_size, tile_size))
 
     result_tiles = []
     for gallery_index in row["top5_indices"]:
         record = records[gallery_index]
-        tile = Image.open(record["image"]).convert("RGB").resize((256, 256))
+        with Image.open(record["image"]) as image:
+            tile = image.convert("RGB").resize((tile_size, tile_size))
         draw = ImageDraw.Draw(tile)
         color = "#00b050" if int(record["coco_id"]) == target_id else "#cc3333"
-        draw.rectangle((3, 3, 252, 252), outline=color, width=6)
+        draw.rectangle((3, 3, tile_size - 4, tile_size - 4), outline=color, width=7)
         result_tiles.append(tile)
 
-    title_height = 90
-    canvas = Image.new("RGB", (256 * 6, 256 + title_height), "white")
+    canvas_width = 2 * margin + 6 * tile_size + 5 * gap
+    canvas_height = header_height + tile_size + margin
+    canvas = Image.new("RGB", (canvas_width, canvas_height), "#f7f7f7")
     draw = ImageDraw.Draw(canvas)
-    title = f"mode={mode}  target={target_id}  rank={row['rank']}"
+    title_font = load_font(30, bold=True)
+    caption_font = load_font(30)
+    title = f"{mode.upper()} RETRIEVAL   |   Target COCO {target_id}   |   Ground-truth rank: {row['rank']}"
+    draw.text((margin, 18), title, fill="#111111", font=title_font)
     if row["caption"]:
-        title += "\n" + "\n".join(textwrap.wrap(row["caption"], width=120)[:2])
-    draw.multiline_text((10, 8), title, fill="black", spacing=4)
+        caption = "\n".join(textwrap.wrap(row["caption"], width=125)[:2])
+        draw.multiline_text((margin, 62), caption, fill="#303030", font=caption_font, spacing=6)
+
     for index, tile in enumerate([query_tile, *result_tiles]):
-        canvas.paste(tile, (index * 256, title_height))
+        x = margin + index * (tile_size + gap)
+        canvas.paste(tile, (x, header_height))
     output.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output, quality=92)
+    canvas.save(output, quality=95, subsampling=0)
+
+
+def render_saved_cases(output: Path, records: list[dict[str, Any]], sketch_field: str = "human_sketch") -> None:
+    record_indices = {int(record["coco_id"]): index for index, record in enumerate(records)}
+    for mode in ("sketch", "text", "mixed"):
+        rows = read_jsonl(output / f"{mode}_top5.jsonl")
+        for row in rows:
+            row["record_index"] = record_indices[int(row["coco_id"])]
+        successes = [row for row in rows if row["rank"] == 1][:3]
+        failures = sorted(
+            (row for row in rows if row["rank"] > 5),
+            key=lambda row: row["rank"],
+            reverse=True,
+        )[:3]
+        for case_type, cases in (("success", successes), ("failure", failures)):
+            for index, row in enumerate(cases, 1):
+                case_grid(row, records, output / "cases" / f"{mode}_{case_type}_{index}.jpg", sketch_field)
 
 
 def save_results(rows: list[dict[str, Any]], path: Path) -> None:
@@ -171,24 +217,39 @@ def main() -> None:
     parser.add_argument("--visual-batch-size", type=int, default=256)
     parser.add_argument("--text-batch-size", type=int, default=512)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--sketch-field",
+        default="human_sketch",
+        help="manifest field used as the sketch query source (human_sketch or synthetic_sketch)",
+    )
+    parser.add_argument(
+        "--render-only",
+        action="store_true",
+        help="redraw case images from existing *_top5.jsonl files without evaluating the model",
+    )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda", 0)
     records = read_jsonl(args.manifest)
     if len(records) != 5000:
         raise RuntimeError(f"expected 5000 test images, found {len(records)}")
+    if args.render_only:
+        render_saved_cases(args.output, records, args.sketch_field)
+        print(f"redrew case images in {args.output / 'cases'}", flush=True)
+        return
+
+    device = torch.device("cuda", 0)
     model = load_model(args.checkpoint, device)
 
     print("encoding 5k image gallery", flush=True)
     gallery = encode_visual(
         model, records, "image", args.image_size, args.visual_batch_size, args.workers, device, sketch=False
     )
-    print("encoding 5k human sketches", flush=True)
+    print(f"encoding 5k sketches (field={args.sketch_field})", flush=True)
     sketch_features = encode_visual(
         model,
         records,
-        "human_sketch",
+        args.sketch_field,
         args.image_size,
         args.visual_batch_size,
         args.workers,
@@ -266,7 +327,7 @@ def main() -> None:
         failures = sorted((row for row in rows if row["rank"] > 5), key=lambda row: row["rank"], reverse=True)[:3]
         for case_type, cases in (("success", successes), ("failure", failures)):
             for index, row in enumerate(cases, 1):
-                case_grid(row, records, args.output / "cases" / f"{mode}_{case_type}_{index}.jpg")
+                case_grid(row, records, args.output / "cases" / f"{mode}_{case_type}_{index}.jpg", args.sketch_field)
     print(json.dumps(all_metrics, indent=2), flush=True)
 
 

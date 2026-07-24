@@ -61,16 +61,53 @@ def load_model(config: dict, device: torch.device) -> CLIP:
         num_class=int(config["model"]["num_classes"]),
         normalize_fused_query=bool(config["model"].get("normalize_fused_query", True)),
     )
-    checkpoint = torch.load(
-        config["model"]["checkpoint"],
-        map_location="cpu",
-        mmap=True,
-        weights_only=False,
-    )
-    state_dict = checkpoint["state_dict"]
-    if next(iter(state_dict)).startswith("module."):
-        state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
-    model.load_state_dict(state_dict, strict=True)
+    init_mode = config["model"].get("init", "official_taskformer")
+    if init_mode == "official_taskformer":
+        checkpoint = torch.load(
+            config["model"]["checkpoint"],
+            map_location="cpu",
+            mmap=True,
+            weights_only=False,
+        )
+        state_dict = checkpoint["state_dict"]
+        if next(iter(state_dict)).startswith("module."):
+            state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
+        model.load_state_dict(state_dict, strict=True)
+    elif init_mode == "clip_pretrained":
+        # Initialize the CLIP backbone from the original OpenAI ViT-B-16 weights
+        # (not the TASK-former/TSBIR checkpoint). OpenAI's ViT-B-16.pt is a
+        # TorchScript archive whose backbone keys match this codebase's CLIP
+        # exactly (302 tensors, 0 shape mismatches); the extra TASK-former heads
+        # (decoder.*, classification_fc_*.*) and the weight-shared visual2.* are
+        # absent from the OpenAI checkpoint and keep their default (random) init.
+        ckpt_path = config["model"]["checkpoint"]
+        try:
+            loaded = torch.jit.load(ckpt_path, map_location="cpu")
+            state_dict = loaded.state_dict()
+        except Exception:
+            checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint and not any(
+                k.startswith(("visual.", "transformer.", "token_embedding", "positional_embedding"))
+                for k in checkpoint
+            ):
+                state_dict = checkpoint["state_dict"]
+            else:
+                state_dict = checkpoint
+        state_dict = {key.removeprefix("module."): tensor.float() for key, tensor in state_dict.items()}
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if int(os.environ.get("RANK", "0")) == 0:
+            missing_extra = [k for k in missing if k.startswith(("visual2.", "decoder.", "classification_fc_"))]
+            missing_other = [k for k in missing if k not in set(missing_extra)]
+            print(f"[clip_pretrained] loaded {len(state_dict)} tensors from {ckpt_path}", flush=True)
+            print(f"[clip_pretrained] missing total={len(missing)} "
+                  f"(visual2*/decoder*/classification* expected = {len(missing_extra)}; "
+                  f"backbone gaps must be 0 -> {len(missing_other)} {missing_other[:8]})", flush=True)
+            print(f"[clip_pretrained] unexpected (ignored) = {len(unexpected)} {unexpected[:8]}", flush=True)
+    elif init_mode in ("random", "from_scratch", "scratch"):
+        # Train from scratch: keep the CLIP constructor's initialize_parameters() init.
+        pass
+    else:
+        raise ValueError(f"unsupported model.init: {init_mode}")
     model.set_grad_checkpointing(bool(config["train"].get("gradient_checkpointing", False)))
     return model.to(device)
 
