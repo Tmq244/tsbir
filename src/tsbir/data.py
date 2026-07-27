@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
+from scipy import ndimage
 from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import (
     CenterCrop,
@@ -94,6 +95,180 @@ def stroke_dropout(image: Image.Image, minimum_keep: float = 0.6) -> Image.Image
     return Image.fromarray(gray, mode="L")
 
 
+def _zhang_suen_skeleton(foreground: np.ndarray) -> np.ndarray:
+    """Return a one-pixel skeleton without consuming any random state."""
+    skeleton = np.pad(foreground.astype(np.uint8), 1)
+    while True:
+        changed = False
+        for first_subiteration in (True, False):
+            center = skeleton[1:-1, 1:-1]
+            p2 = skeleton[:-2, 1:-1]
+            p3 = skeleton[:-2, 2:]
+            p4 = skeleton[1:-1, 2:]
+            p5 = skeleton[2:, 2:]
+            p6 = skeleton[2:, 1:-1]
+            p7 = skeleton[2:, :-2]
+            p8 = skeleton[1:-1, :-2]
+            p9 = skeleton[:-2, :-2]
+            neighbours = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9
+            transition_count = sum(
+                (left == 0) & (right == 1)
+                for left, right in (
+                    (p2, p3), (p3, p4), (p4, p5), (p5, p6),
+                    (p6, p7), (p7, p8), (p8, p9), (p9, p2),
+                )
+            )
+            if first_subiteration:
+                topology = (p2 * p4 * p6 == 0) & (p4 * p6 * p8 == 0)
+            else:
+                topology = (p2 * p4 * p8 == 0) & (p2 * p6 * p8 == 0)
+            remove = center.astype(bool) & (neighbours >= 2) & (neighbours <= 6)
+            remove &= transition_count == 1
+            remove &= topology
+            if remove.any():
+                center[remove] = 0
+                changed = True
+        if not changed:
+            break
+    return skeleton[1:-1, 1:-1].astype(bool)
+
+
+def _ordered_component_pixels(component: np.ndarray) -> list[tuple[int, int]]:
+    """Trace an unbranched skeleton component in spatial order."""
+    coordinates = [tuple(point) for point in np.argwhere(component)]
+    if len(coordinates) <= 1:
+        return coordinates
+    coordinate_set = set(coordinates)
+
+    def adjacent(point: tuple[int, int]) -> list[tuple[int, int]]:
+        row, column = point
+        return sorted(
+            (row + dr, column + dc)
+            for dr in (-1, 0, 1)
+            for dc in (-1, 0, 1)
+            if (dr or dc) and (row + dr, column + dc) in coordinate_set
+        )
+
+    endpoints = [point for point in coordinates if len(adjacent(point)) <= 1]
+    start = min(endpoints or coordinates)
+    ordered: list[tuple[int, int]] = []
+    visited: set[tuple[int, int]] = set()
+    stack = [start]
+    while stack:
+        point = stack.pop()
+        if point in visited:
+            continue
+        visited.add(point)
+        ordered.append(point)
+        # Reversed push makes the traversal's next point lexicographically
+        # smallest and therefore deterministic.
+        stack.extend(reversed([item for item in adjacent(point) if item not in visited]))
+    if len(visited) != len(coordinates):
+        ordered.extend(sorted(coordinate_set - visited))
+    return ordered
+
+
+def _skeleton_segment_labels(skeleton: np.ndarray, maximum_length: int) -> np.ndarray:
+    neighbour_kernel = np.ones((3, 3), dtype=np.uint8)
+    neighbour_kernel[1, 1] = 0
+    neighbour_count = ndimage.convolve(skeleton.astype(np.uint8), neighbour_kernel, mode="constant")
+    nodes = skeleton & (neighbour_count != 2)
+    paths = skeleton & ~nodes
+    component_labels, component_count = ndimage.label(paths, structure=np.ones((3, 3), dtype=np.uint8))
+    segment_labels = np.zeros(skeleton.shape, dtype=np.int32)
+    next_label = 1
+    component_slices = ndimage.find_objects(component_labels)
+    for component_id, component_slice in enumerate(component_slices, start=1):
+        if component_slice is None:
+            continue
+        local_component = component_labels[component_slice] == component_id
+        ordered = _ordered_component_pixels(local_component)
+        row_offset = component_slice[0].start
+        column_offset = component_slice[1].start
+        ordered = [(row + row_offset, column + column_offset) for row, column in ordered]
+        chunk_count = max(1, math.ceil(len(ordered) / maximum_length))
+        for chunk in np.array_split(np.asarray(ordered, dtype=np.int32), chunk_count):
+            if not len(chunk):
+                continue
+            segment_labels[chunk[:, 0], chunk[:, 1]] = next_label
+            next_label += 1
+
+    # Junction/end pixels were cut to separate paths. Attach each of them to
+    # its nearest path segment. A tiny dot with no path becomes one segment.
+    if next_label == 1:
+        if skeleton.any():
+            segment_labels[skeleton] = 1
+        return segment_labels
+    _, nearest = ndimage.distance_transform_edt(segment_labels == 0, return_indices=True)
+    nearest_labels = segment_labels[nearest[0], nearest[1]]
+    segment_labels[nodes] = nearest_labels[nodes]
+    return segment_labels
+
+
+def stroke_segment_dropout(
+    image: Image.Image,
+    minimum_keep: float = 0.6,
+    maximum_segment_length: int = 64,
+    maximum_segment_area_ratio: float = 0.2,
+    minimum_segments_remaining: int = 3,
+) -> Image.Image:
+    """Delete coherent skeleton segments under the paper's keep-ratio budget.
+
+    This intentionally consumes the same two global RNG calls as
+    :func:`stroke_dropout`. All later choices are derived from ``random_field``
+    so changing only the dropout mode does not shift subsequent augmentations.
+    """
+    gray = np.asarray(image.convert("L")).copy()
+    foreground = gray < 245
+    keep_probability = random.uniform(minimum_keep, 1.0)
+    random_field = np.random.random(gray.shape)
+    foreground_area = int(foreground.sum())
+    if foreground_area == 0:
+        return Image.fromarray(gray, mode="L")
+
+    skeleton = _zhang_suen_skeleton(foreground)
+    segment_labels = _skeleton_segment_labels(skeleton, maximum_segment_length)
+    if not segment_labels.any():
+        return Image.fromarray(gray, mode="L")
+
+    # Expand the one-pixel labels back over the anti-aliased/thick foreground.
+    _, nearest = ndimage.distance_transform_edt(segment_labels == 0, return_indices=True)
+    foreground_segments = segment_labels[nearest[0], nearest[1]]
+    foreground_labels = foreground_segments[foreground]
+    segment_count = int(segment_labels.max())
+    segment_areas = np.bincount(foreground_labels, minlength=segment_count + 1)
+
+    priorities = np.full(segment_count + 1, -1.0, dtype=np.float64)
+    flat_labels = segment_labels.ravel()
+    labelled_indices = np.flatnonzero(flat_labels)
+    represented_labels, first_positions = np.unique(
+        flat_labels[labelled_indices], return_index=True,
+    )
+    representative_indices = labelled_indices[first_positions]
+    priorities[represented_labels] = random_field.ravel()[representative_indices]
+
+    removal_budget = int(math.floor(foreground_area * (1.0 - keep_probability)))
+    maximum_segment_area = int(math.floor(foreground_area * maximum_segment_area_ratio))
+    required_remaining = min(minimum_segments_remaining, segment_count)
+    removed_area = 0
+    removed_segments: list[int] = []
+    for segment_id in np.argsort(priorities[1:])[::-1] + 1:
+        area = int(segment_areas[segment_id])
+        if area <= 0 or area > maximum_segment_area:
+            continue
+        if segment_count - len(removed_segments) <= required_remaining:
+            break
+        if removed_area + area > removal_budget:
+            continue
+        removed_segments.append(int(segment_id))
+        removed_area += area
+
+    if removed_segments:
+        removed = foreground & np.isin(foreground_segments, removed_segments)
+        gray[removed] = 255
+    return Image.fromarray(gray, mode="L")
+
+
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     with Path(path).open() as handle:
         return [json.loads(line) for line in handle if line.strip()]
@@ -107,6 +282,7 @@ class CaptionSketchDataset(Dataset):
         training: bool = True,
         use_human_sketch: bool = False,
         query_dropout: float = 0.2,
+        sketch_dropout_mode: str = "pixel",
     ) -> None:
         self.records = read_jsonl(manifest)
         self.pairs = [
@@ -117,6 +293,9 @@ class CaptionSketchDataset(Dataset):
         self.training = training
         self.use_human_sketch = use_human_sketch
         self.query_dropout = query_dropout if training else 0.0
+        if sketch_dropout_mode not in {"pixel", "segment"}:
+            raise ValueError(f"unsupported sketch_dropout_mode: {sketch_dropout_mode}")
+        self.sketch_dropout_mode = sketch_dropout_mode
         if training:
             self.image_transform = train_image_transform(image_size)
             self.sketch_transform = train_sketch_transform(image_size)
@@ -138,7 +317,10 @@ class CaptionSketchDataset(Dataset):
             raise RuntimeError(f"record {record['coco_id']} has no {sketch_key}")
         sketch = Image.open(sketch_path).convert("L")
         if self.training:
-            sketch = stroke_dropout(sketch)
+            if self.sketch_dropout_mode == "pixel":
+                sketch = stroke_dropout(sketch)
+            else:
+                sketch = stroke_segment_dropout(sketch)
 
         drop_draw = random.random()
         drop_sketch = self.training and drop_draw < self.query_dropout / 2

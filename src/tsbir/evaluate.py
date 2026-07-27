@@ -189,6 +189,7 @@ def case_grid(
     margin = 24
     gap = 16
     header_height = 148
+    label_height = 42
     mode = row["mode"]
     target_id = int(row["coco_id"])
     if mode == "text":
@@ -208,40 +209,165 @@ def case_grid(
         draw.rectangle((3, 3, tile_size - 4, tile_size - 4), outline=color, width=7)
         result_tiles.append(tile)
 
-    canvas_width = 2 * margin + 6 * tile_size + 5 * gap
-    canvas_height = header_height + tile_size + margin
+    tiles = [query_tile, *result_tiles]
+    labels = ["QUERY", *[f"TOP-{rank}" for rank in range(1, 6)]]
+    if int(row["rank"]) > 5:
+        target_record = records[row["record_index"]]
+        with Image.open(target_record["image"]) as image:
+            correct_tile = image.convert("RGB").resize((tile_size, tile_size))
+        correct_draw = ImageDraw.Draw(correct_tile)
+        correct_draw.rectangle(
+            (3, 3, tile_size - 4, tile_size - 4),
+            outline="#00b050",
+            width=7,
+        )
+        tiles.append(correct_tile)
+        labels.append("CORRECT IMAGE")
+
+    canvas_width = 2 * margin + len(tiles) * tile_size + (len(tiles) - 1) * gap
+    canvas_height = header_height + label_height + tile_size + margin
     canvas = Image.new("RGB", (canvas_width, canvas_height), "#f7f7f7")
     draw = ImageDraw.Draw(canvas)
     title_font = load_font(30, bold=True)
     caption_font = load_font(30)
+    label_font = load_font(23, bold=True)
     title = f"{mode.upper()} RETRIEVAL   |   Target COCO {target_id}   |   Ground-truth rank: {row['rank']}"
     draw.text((margin, 18), title, fill="#111111", font=title_font)
     if row["caption"]:
         caption = "\n".join(textwrap.wrap(row["caption"], width=125)[:2])
         draw.multiline_text((margin, 62), caption, fill="#303030", font=caption_font, spacing=6)
 
-    for index, tile in enumerate([query_tile, *result_tiles]):
+    for index, (tile, label) in enumerate(zip(tiles, labels)):
         x = margin + index * (tile_size + gap)
-        canvas.paste(tile, (x, header_height))
+        label_box = draw.textbbox((0, 0), label, font=label_font)
+        label_width = label_box[2] - label_box[0]
+        label_color = "#00843d" if label == "CORRECT IMAGE" else "#333333"
+        draw.text(
+            (x + (tile_size - label_width) / 2, header_height + 6),
+            label,
+            fill=label_color,
+            font=label_font,
+        )
+        canvas.paste(tile, (x, header_height + label_height))
     output.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output, quality=95, subsampling=0)
 
 
-def render_saved_cases(output: Path, records: list[dict[str, Any]], sketch_field: str = "human_sketch") -> None:
+def random_case_selection(
+    rows: list[dict[str, Any]],
+    cases_per_type: int,
+    seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Select reproducible, diverse Top-5 successes and failures."""
+
+    rng = np.random.default_rng(seed)
+
+    def sample(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not candidates or cases_per_type == 0:
+            return []
+        order = rng.permutation(len(candidates)).tolist()
+        selected: list[dict[str, Any]] = []
+        selected_indices: set[int] = set()
+        seen_targets: set[int] = set()
+
+        # Text and mixed evaluation have several captions per image. Prefer
+        # distinct target images so that the visual examples stay diverse.
+        for candidate_index in order:
+            row = candidates[candidate_index]
+            target_id = int(row["coco_id"])
+            if target_id in seen_targets:
+                continue
+            selected.append(row)
+            selected_indices.add(candidate_index)
+            seen_targets.add(target_id)
+            if len(selected) == cases_per_type:
+                return selected
+
+        # This fallback matters only when fewer distinct images than requested
+        # are available; it still samples rows without replacement.
+        for candidate_index in order:
+            if candidate_index in selected_indices:
+                continue
+            selected.append(candidates[candidate_index])
+            if len(selected) == cases_per_type:
+                break
+        return selected
+
+    successes = sample([row for row in rows if int(row["rank"]) <= 5])
+    failures = sample([row for row in rows if int(row["rank"]) > 5])
+    return successes, failures
+
+
+def render_case_images(
+    output: Path,
+    records: list[dict[str, Any]],
+    mode_rows: dict[str, list[dict[str, Any]]],
+    sketch_field: str,
+    cases_per_type: int,
+    case_seed: int,
+) -> None:
+    cases_dir = output / "cases"
+    cases_dir.mkdir(parents=True, exist_ok=True)
+    selection_rows = []
+    for mode_index, mode in enumerate(("sketch", "text", "mixed")):
+        successes, failures = random_case_selection(
+            mode_rows[mode],
+            cases_per_type,
+            case_seed + mode_index,
+        )
+        for case_type, cases in (("success", successes), ("failure", failures)):
+            for index, row in enumerate(cases, 1):
+                filename = f"{mode}_{case_type}_{index}.jpg"
+                case_grid(row, records, cases_dir / filename, sketch_field)
+                selection_rows.append(
+                    {
+                        "file": filename,
+                        "mode": mode,
+                        "case_type": case_type,
+                        "coco_id": int(row["coco_id"]),
+                        "caption": row["caption"],
+                        "rank": int(row["rank"]),
+                        "top5_coco_ids": row["top5_coco_ids"],
+                    }
+                )
+
+    with (cases_dir / "selection.json").open("w") as handle:
+        json.dump(
+            {
+                "seed": case_seed,
+                "cases_per_type": cases_per_type,
+                "success_definition": "ground-truth rank <= 5",
+                "failure_definition": "ground-truth rank > 5",
+                "cases": selection_rows,
+            },
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+def render_saved_cases(
+    output: Path,
+    records: list[dict[str, Any]],
+    sketch_field: str = "human_sketch",
+    cases_per_type: int = 6,
+    case_seed: int = 2026,
+) -> None:
     record_indices = {int(record["coco_id"]): index for index, record in enumerate(records)}
+    mode_rows: dict[str, list[dict[str, Any]]] = {}
     for mode in ("sketch", "text", "mixed"):
         rows = read_jsonl(output / f"{mode}_top5.jsonl")
         for row in rows:
             row["record_index"] = record_indices[int(row["coco_id"])]
-        successes = [row for row in rows if row["rank"] == 1][:3]
-        failures = sorted(
-            (row for row in rows if row["rank"] > 5),
-            key=lambda row: row["rank"],
-            reverse=True,
-        )[:3]
-        for case_type, cases in (("success", successes), ("failure", failures)):
-            for index, row in enumerate(cases, 1):
-                case_grid(row, records, output / "cases" / f"{mode}_{case_type}_{index}.jpg", sketch_field)
+        mode_rows[mode] = rows
+    render_case_images(
+        output,
+        records,
+        mode_rows,
+        sketch_field,
+        cases_per_type,
+        case_seed,
+    )
 
 
 def save_results(rows: list[dict[str, Any]], path: Path) -> None:
@@ -285,14 +411,34 @@ def main() -> None:
         action="store_true",
         help="redraw case images from existing *_top5.jsonl files without evaluating the model",
     )
+    parser.add_argument(
+        "--cases-per-type",
+        type=int,
+        default=6,
+        help="number of random success and failure examples rendered for each retrieval mode",
+    )
+    parser.add_argument(
+        "--case-seed",
+        type=int,
+        default=2026,
+        help="random seed used for reproducible case selection",
+    )
     args = parser.parse_args()
+    if args.cases_per_type < 1:
+        parser.error("--cases-per-type must be at least 1")
     args.output.mkdir(parents=True, exist_ok=True)
 
     records = read_jsonl(args.manifest)
     if len(records) != 5000:
         raise RuntimeError(f"expected 5000 test images, found {len(records)}")
     if args.render_only:
-        render_saved_cases(args.output, records, args.sketch_field)
+        render_saved_cases(
+            args.output,
+            records,
+            args.sketch_field,
+            args.cases_per_type,
+            args.case_seed,
+        )
         print(f"redrew case images in {args.output / 'cases'}", flush=True)
         return
 
@@ -436,11 +582,14 @@ def main() -> None:
         json.dump(all_alpha_metrics, handle, indent=2)
     for mode, rows in mode_rows.items():
         save_results(rows, args.output / f"{mode}_top5.jsonl")
-        successes = [row for row in rows if row["rank"] == 1][:3]
-        failures = sorted((row for row in rows if row["rank"] > 5), key=lambda row: row["rank"], reverse=True)[:3]
-        for case_type, cases in (("success", successes), ("failure", failures)):
-            for index, row in enumerate(cases, 1):
-                case_grid(row, records, args.output / "cases" / f"{mode}_{case_type}_{index}.jpg", args.sketch_field)
+    render_case_images(
+        args.output,
+        records,
+        mode_rows,
+        args.sketch_field,
+        args.cases_per_type,
+        args.case_seed,
+    )
     print(json.dumps({"retrieval": all_metrics, "alpha": all_alpha_metrics}, indent=2), flush=True)
 
 

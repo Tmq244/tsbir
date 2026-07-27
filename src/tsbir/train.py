@@ -247,6 +247,7 @@ def main() -> None:
         config["data"]["train_manifest"],
         image_size=int(config["data"]["image_size"]),
         training=True,
+        sketch_dropout_mode=config["data"].get("sketch_dropout_mode", "pixel"),
     )
     expected_pairs = int(config["data"]["train_pairs_per_epoch"])
     if len(dataset) != expected_pairs:
