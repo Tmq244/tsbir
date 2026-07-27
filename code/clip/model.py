@@ -262,7 +262,9 @@ class CLIP(nn.Module):
                  weight_sharing: bool = False,
                  feature_fusion: str = 'avg',
                  num_class: int = 90,
-                 normalize_fused_query: bool = True
+                 normalize_fused_query: bool = True,
+                 gate_hidden_dim: int = 256,
+                 gate_alpha_init: float = 0.5,
                  ):
         super().__init__()
         #set default to weight sharing
@@ -349,7 +351,32 @@ class CLIP(nn.Module):
         )
         self.classification_fc_1 = nn.Linear(embed_dim, 1024)
         self.classification_fc_2 = nn.Linear(1024, num_class)
-        
+
+        # Learnable per-query fusion gate, instantiated only for feature_fusion
+        # == 'gate'.  Input is the concatenation of the two normalised modality
+        # features and their Hadamard product (captures cross-modal agreement);
+        # output is a scalar alpha in (0, 1).  Initialised so alpha starts
+        # constant (=gate_alpha_init, exactly the fixed-weight average at the
+        # default cold start) and only later learns per-query variation. Keeping it
+        # absent for 'avg' leaves avg models weight-for-weight identical to the
+        # original (no extra params, no DDP unused-parameter errors).
+        if feature_fusion == 'gate':
+            if gate_hidden_dim <= 0:
+                raise ValueError(f"gate_hidden_dim must be positive, got {gate_hidden_dim}")
+            if not 0.0 < gate_alpha_init < 1.0:
+                raise ValueError(f"gate_alpha_init must be in (0, 1), got {gate_alpha_init}")
+            self.gate = nn.Sequential(
+                nn.Linear(embed_dim * 3, gate_hidden_dim),
+                nn.GELU(),
+                nn.Linear(gate_hidden_dim, 1),
+            )
+            # Zero output weights make the cold-start gate exactly constant at
+            # gate_alpha_init.  With the default 0.5, gated fusion is therefore
+            # numerically identical to the original average before training.
+            nn.init.zeros_(self.gate[-1].weight)
+            gate_bias = float(np.log(gate_alpha_init / (1.0 - gate_alpha_init)))
+            nn.init.constant_(self.gate[-1].bias, gate_bias)
+
         self.initialize_parameters()
 
     def initialize_parameters(self):
@@ -462,14 +489,42 @@ class CLIP(nn.Module):
         
         return image_features, fused_feature
 
-    def feature_fuse(self, text_features, sketch_features):
-        #mode = avg|max
+    def feature_fuse(self, text_features, sketch_features, return_alpha=False):
+        #mode = avg|gate
         if self.feature_fusion == 'avg':
-            fused_features = (text_features + sketch_features)/2
+            # Preserve the original operation order for exact avg regression;
+            # addition also retains its existing batch-broadcasting behavior.
+            fused_features = (text_features + sketch_features) / 2
+            alpha = torch.full(
+                (*fused_features.shape[:-1], 1),
+                0.5,
+                device=fused_features.device,
+                dtype=fused_features.dtype,
+            )
+        elif self.feature_fusion == 'gate':
+            # Direct train/eval entry points keep the gate in fp32.  The legacy
+            # clip.load/build_model path may convert Linear layers to fp16, so
+            # match the registered gate dtype here instead of assuming fp32.
+            # Broadcasting is required by the existing single-modality eval
+            # path, which combines a batch with one shared blank embedding.
+            text_features, sketch_features = torch.broadcast_tensors(
+                text_features,
+                sketch_features,
+            )
+            with torch.autocast(device_type=text_features.device.type, enabled=False):
+                gate_dtype = self.gate[0].weight.dtype
+                t = text_features.to(dtype=gate_dtype)
+                s = sketch_features.to(dtype=gate_dtype)
+                gate_in = torch.cat([t, s, t * s], dim=-1)
+                alpha = torch.sigmoid(self.gate(gate_in).float())
+            fusion_alpha = alpha.to(text_features.dtype)
+            fused_features = fusion_alpha * text_features + (1.0 - fusion_alpha) * sketch_features
         else:
             raise Exception(f'Mode {self.feature_fusion} not yet supported')
         if self.normalize_fused_query:
             fused_features = F.normalize(fused_features, dim=-1)
+        if return_alpha:
+            return fused_features, alpha
         return fused_features
     
 def convert_weights(model: nn.Module):
@@ -494,6 +549,10 @@ def convert_weights(model: nn.Module):
                     attr.data = attr.data.half()
 
     model.apply(_convert_weights_to_fp16)
+    # Gating logits and sigmoid are deliberately evaluated in fp32.  Preserve
+    # that policy for models built through the original clip.load() API too.
+    if hasattr(model, "gate"):
+        model.gate.float()
 
 
 def build_model(state_dict: dict, weight_sharing: bool, feature_fusion: str, num_class: int):
@@ -521,12 +580,14 @@ def build_model(state_dict: dict, weight_sharing: bool, feature_fusion: str, num
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
 
+    gate_hidden_dim = state_dict.get("gate.0.weight", torch.empty(256, 0)).shape[0]
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
         context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, 
         weight_sharing, feature_fusion,
-        num_class=num_class
+        num_class=num_class,
+        gate_hidden_dim=gate_hidden_dim,
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:

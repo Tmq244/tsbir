@@ -131,11 +131,36 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
         state_dict = torch.load(model_path, map_location="cpu")
 
     if not jit:
-        try:
-            model = build_model(state_dict or model.state_dict(), weight_sharing, feature_fusion, num_class = num_class).to(device)
-        except KeyError:
-            sd = {k[7:]: v for k,v in state_dict["state_dict"].items()}
-            model = build_model(sd, weight_sharing, feature_fusion, num_class=num_class).to(device)
+        checkpoint = state_dict
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint or model.state_dict()
+        if next(iter(state_dict)).startswith("module."):
+            state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
+
+        state_fusion = "gate" if any(key.startswith("gate.") for key in state_dict) else "avg"
+        saved_fusion = None
+        if isinstance(checkpoint, dict):
+            saved_fusion = checkpoint.get("config", {}).get("model", {}).get("feature_fusion")
+        if saved_fusion is not None and saved_fusion != state_fusion:
+            raise RuntimeError(
+                f"checkpoint metadata says feature_fusion={saved_fusion!r}, "
+                f"but its state_dict implies {state_fusion!r}"
+            )
+        if feature_fusion == "auto":
+            feature_fusion = saved_fusion or state_fusion
+        elif state_fusion == "gate" and feature_fusion != "gate":
+            raise ValueError(
+                f"feature_fusion={feature_fusion!r} would ignore the gate parameters in the checkpoint"
+            )
+
+        model = build_model(
+            state_dict,
+            weight_sharing,
+            feature_fusion,
+            num_class=num_class,
+        ).to(device)
 
         if str(device) == "cpu":
             model.float()

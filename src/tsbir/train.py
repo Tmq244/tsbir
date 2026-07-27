@@ -32,6 +32,10 @@ from tsbir.data import CaptionSketchDataset, DistributedUniqueImageBatchSampler 
 from tsbir.losses import AsymmetricLoss, distributed_contrastive_loss  # noqa: E402
 
 
+def _invalid_checkpoint_keys(keys, allowed_prefixes):
+    return [key for key in keys if not key.startswith(tuple(allowed_prefixes))]
+
+
 def setup_distributed() -> tuple[int, int, int]:
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -60,6 +64,8 @@ def load_model(config: dict, device: torch.device) -> CLIP:
         feature_fusion=config["model"]["feature_fusion"],
         num_class=int(config["model"]["num_classes"]),
         normalize_fused_query=bool(config["model"].get("normalize_fused_query", True)),
+        gate_hidden_dim=int(config["model"].get("gate_hidden_dim", 256)),
+        gate_alpha_init=float(config["model"].get("gate_alpha_init", 0.5)),
     )
     init_mode = config["model"].get("init", "official_taskformer")
     if init_mode == "official_taskformer":
@@ -72,7 +78,26 @@ def load_model(config: dict, device: torch.device) -> CLIP:
         state_dict = checkpoint["state_dict"]
         if next(iter(state_dict)).startswith("module."):
             state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
-        model.load_state_dict(state_dict, strict=True)
+        # strict=False so a backbone checkpoint without gate.* params loads into
+        # a gate-enabled model (gate keeps its constructor init); for an avg model
+        # there are no missing keys, so behaviour is identical to strict=True.
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        allowed_missing = ("gate.",) if config["model"]["feature_fusion"] == "gate" else ()
+        invalid_missing = _invalid_checkpoint_keys(missing, allowed_missing)
+        if int(os.environ.get("RANK", "0")) == 0 and (missing or unexpected):
+            gate_missing = [k for k in missing if k.startswith("gate.")]
+            print(f"[official_taskformer] loaded {len(state_dict)} tensors from "
+                  f"{config['model']['checkpoint']}", flush=True)
+            print(f"[official_taskformer] missing total={len(missing)} "
+                  f"(gate.* expected under feature_fusion=gate = {len(gate_missing)}; "
+                  f"backbone gaps must be 0 -> {len(invalid_missing)} {invalid_missing[:8]})", flush=True)
+            print(f"[official_taskformer] unexpected = {len(unexpected)} "
+                  f"{unexpected[:8]}", flush=True)
+        if invalid_missing or unexpected:
+            raise RuntimeError(
+                "official TASK-former checkpoint is incompatible: "
+                f"invalid missing keys={invalid_missing[:8]}, unexpected keys={unexpected[:8]}"
+            )
     elif init_mode == "clip_pretrained":
         # Initialize the CLIP backbone from the original OpenAI ViT-B-16 weights
         # (not the TASK-former/TSBIR checkpoint). OpenAI's ViT-B-16.pt is a
@@ -94,15 +119,27 @@ def load_model(config: dict, device: torch.device) -> CLIP:
             else:
                 state_dict = checkpoint
         state_dict = {key.removeprefix("module."): tensor.float() for key, tensor in state_dict.items()}
+        # TorchScript CLIP archives expose these three scalar metadata entries;
+        # they are not learnable model parameters.
+        for metadata_key in ("input_resolution", "context_length", "vocab_size"):
+            state_dict.pop(metadata_key, None)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        allowed_missing = ("visual2.", "decoder.", "classification_fc_")
+        if config["model"]["feature_fusion"] == "gate":
+            allowed_missing += ("gate.",)
+        missing_other = _invalid_checkpoint_keys(missing, allowed_missing)
         if int(os.environ.get("RANK", "0")) == 0:
-            missing_extra = [k for k in missing if k.startswith(("visual2.", "decoder.", "classification_fc_"))]
-            missing_other = [k for k in missing if k not in set(missing_extra)]
+            missing_extra = [k for k in missing if k not in set(missing_other)]
             print(f"[clip_pretrained] loaded {len(state_dict)} tensors from {ckpt_path}", flush=True)
             print(f"[clip_pretrained] missing total={len(missing)} "
                   f"(visual2*/decoder*/classification* expected = {len(missing_extra)}; "
                   f"backbone gaps must be 0 -> {len(missing_other)} {missing_other[:8]})", flush=True)
-            print(f"[clip_pretrained] unexpected (ignored) = {len(unexpected)} {unexpected[:8]}", flush=True)
+            print(f"[clip_pretrained] unexpected = {len(unexpected)} {unexpected[:8]}", flush=True)
+        if missing_other or unexpected:
+            raise RuntimeError(
+                "OpenAI CLIP checkpoint is incompatible: "
+                f"invalid missing keys={missing_other[:8]}, unexpected keys={unexpected[:8]}"
+            )
     elif init_mode in ("random", "from_scratch", "scratch"):
         # Train from scratch: keep the CLIP constructor's initialize_parameters() init.
         pass
@@ -112,19 +149,32 @@ def load_model(config: dict, device: torch.device) -> CLIP:
     return model.to(device)
 
 
-def parameter_groups(model: torch.nn.Module, weight_decay: float):
-    decay, no_decay = [], []
+def parameter_groups(model: torch.nn.Module, weight_decay: float, gate_lr=None):
+    # Gate params get their own (higher) LR; gate and backbone parameters both
+    # keep biases and one-dimensional parameters out of weight decay.
+    decay, no_decay, gate_decay, gate_no_decay = [], [], [], []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if parameter.ndim < 2 or name.endswith("bias") or name == "logit_scale":
+        if name.startswith("gate."):
+            target = gate_no_decay if parameter.ndim < 2 or name.endswith("bias") else gate_decay
+            target.append(parameter)
+        elif parameter.ndim < 2 or name.endswith("bias") or name == "logit_scale":
             no_decay.append(parameter)
         else:
             decay.append(parameter)
-    return [
-        {"params": no_decay, "weight_decay": 0.0},
-        {"params": decay, "weight_decay": weight_decay},
+    groups = [
+        {"name": "backbone_no_decay", "params": no_decay, "weight_decay": 0.0},
+        {"name": "backbone_decay", "params": decay, "weight_decay": weight_decay},
     ]
+    gate_options = {"name": "gate", "weight_decay": weight_decay}
+    if gate_lr is not None:
+        gate_options["lr"] = gate_lr
+    if gate_decay:
+        groups.append({**gate_options, "params": gate_decay})
+    if gate_no_decay:
+        groups.append({**gate_options, "params": gate_no_decay, "weight_decay": 0.0})
+    return groups
 
 
 def make_scheduler(optimizer, warmup_steps: int, total_steps: int, minimum_ratio: float):
@@ -154,10 +204,15 @@ def save_checkpoint(path: Path, model: CLIP, optimizer, scheduler, epoch: int, g
     temporary.replace(path)
 
 
-def save_weights(path: Path, model: CLIP, epoch: int) -> None:
+def save_weights(path: Path, model: CLIP, epoch: int, config: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
-        {"epoch": epoch, "state_dict": model.state_dict()},
+        {
+            "format_version": 2,
+            "epoch": epoch,
+            "state_dict": model.state_dict(),
+            "config": config,
+        },
         temporary,
     )
     temporary.replace(path)
@@ -223,8 +278,9 @@ def main() -> None:
     else:
         ddp = model
         module = model
+    gate_lr = float(config["train"].get("gate_learning_rate", config["train"]["learning_rate"]))
     optimizer = AdamW(
-        parameter_groups(model, float(config["train"]["weight_decay"])),
+        parameter_groups(model, float(config["train"]["weight_decay"]), gate_lr),
         lr=float(config["train"]["learning_rate"]),
         betas=(float(config["train"]["beta1"]), float(config["train"]["beta2"])),
         eps=float(config["train"]["eps"]),
@@ -251,7 +307,13 @@ def main() -> None:
     csv_file = (output_dir / "train.csv").open("w", newline="") if rank == 0 else None
     csv_writer = csv.writer(csv_file) if csv_file else None
     if csv_writer:
-        csv_writer.writerow(["epoch", "step", "loss", "embedding", "classification", "decoder", "lr", "seconds"])
+        csv_writer.writerow(
+            [
+                "epoch", "step", "loss", "embedding", "classification", "decoder",
+                "lr", "gate_lr", "alpha_mean", "alpha_std", "alpha_p10", "alpha_p50",
+                "alpha_p90", "seconds",
+            ]
+        )
 
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
@@ -276,7 +338,11 @@ def main() -> None:
                 image_features = image_features.float()
                 text_features = text_features.float()
                 sketch_features = sketch_features.float()
-                query_features = module.feature_fuse(text_features, sketch_features)
+                query_features, fusion_alpha = module.feature_fuse(
+                    text_features,
+                    sketch_features,
+                    return_alpha=True,
+                )
                 embedding = distributed_contrastive_loss(
                     image_features,
                     query_features,
@@ -316,18 +382,43 @@ def main() -> None:
                 values = [float(x.detach()) for x in (loss, embedding, classification, decoder)]
                 elapsed = time.time() - started
                 lr = optimizer.param_groups[0]["lr"]
+                gate_lr_value = next(
+                    (group["lr"] for group in optimizer.param_groups if group.get("name") == "gate"),
+                    lr,
+                )
+                alpha_values = fusion_alpha.detach().float().flatten()
+                alpha_mean = float(alpha_values.mean())
+                alpha_std = float(alpha_values.std(unbiased=False))
+                alpha_p10, alpha_p50, alpha_p90 = (
+                    float(value) for value in torch.quantile(
+                        alpha_values,
+                        torch.tensor([0.1, 0.5, 0.9], device=alpha_values.device),
+                    )
+                )
                 print(
                     f"epoch={epoch + 1} step={global_step}/{total_updates} "
                     f"loss={values[0]:.4f} Le={values[1]:.4f} Lc={values[2]:.4f} "
-                    f"Ld={values[3]:.4f} lr={lr:.3e} "
+                    f"Ld={values[3]:.4f} lr={lr:.3e} gate_lr={gate_lr_value:.3e} "
+                    f"alpha={alpha_mean:.3f}+/-{alpha_std:.3f} "
                     f"peak_mem={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB",
                     flush=True,
                 )
-                csv_writer.writerow([epoch + 1, global_step, *values, lr, elapsed])
+                csv_writer.writerow(
+                    [
+                        epoch + 1, global_step, *values, lr, gate_lr_value,
+                        alpha_mean, alpha_std, alpha_p10, alpha_p50, alpha_p90, elapsed,
+                    ]
+                )
                 csv_file.flush()
                 for name, value in zip(("total", "embedding", "classification", "decoder"), values):
                     writer.add_scalar(f"loss/{name}", value, global_step)
                 writer.add_scalar("train/lr", lr, global_step)
+                writer.add_scalar("train/gate_lr", gate_lr_value, global_step)
+                writer.add_scalar("fusion/alpha_mean", alpha_mean, global_step)
+                writer.add_scalar("fusion/alpha_std", alpha_std, global_step)
+                writer.add_scalar("fusion/alpha_p10", alpha_p10, global_step)
+                writer.add_scalar("fusion/alpha_p50", alpha_p50, global_step)
+                writer.add_scalar("fusion/alpha_p90", alpha_p90, global_step)
 
         if args.smoke:
             break
@@ -335,8 +426,8 @@ def main() -> None:
             dist.barrier()
         if rank == 0:
             save_checkpoint(output_dir / "last.ckpt", model, optimizer, scheduler, epoch + 1, global_step, config)
-            save_weights(output_dir / f"epoch_{epoch + 1:03d}_weights.pt", model, epoch + 1)
-            save_weights(output_dir / "last_weights.pt", model, epoch + 1)
+            save_weights(output_dir / f"epoch_{epoch + 1:03d}_weights.pt", model, epoch + 1, config)
+            save_weights(output_dir / "last_weights.pt", model, epoch + 1, config)
             print(f"epoch={epoch + 1} checkpoints saved", flush=True)
         if world_size > 1:
             dist.barrier()

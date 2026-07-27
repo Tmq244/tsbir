@@ -1,0 +1,72 @@
+experiment:
+  name: taskformer_coco_clip_gate_joint_10ep_gpu12
+  seed: 2026
+  output_dir: outputs/taskformer_coco_clip_gate_joint_10ep_gpu12
+
+data:
+  root: data
+  train_manifest: data/processed/manifests/train.jsonl
+  val_manifest: data/processed/manifests/val.jsonl
+  test_manifest: data/processed/manifests/test.jsonl
+  caption_sampling: all
+  train_pairs_per_epoch: 566747
+  image_size: 224
+  workers_per_gpu: 6
+
+model:
+  architecture: ViT-B-16
+  embed_dim: 512
+  weight_sharing: true
+  feature_fusion: gate              # 可学习逐查询门控融合（替代固定 avg）
+  gate_hidden_dim: 256
+  gate_alpha_init: 0.5             # 冷启动严格等价 avg，再逐查询分化
+  normalize_fused_query: true
+  num_classes: 90
+  decoder_depth: 6
+  decoder_heads: 8
+  decoder_max_length: 77
+  init: clip_pretrained           # 从原版 OpenAI CLIP ViT-B/16 backbone 初始化（gate 头随机，靠 strict=False 容忍）
+  checkpoint: model/ViT-B-16.pt   # OpenAI 官方 CLIP 权重（TorchScript），backbone 部分加载，gate/decoder/分类头随机
+  load_optimizer: false
+
+loss:
+  contrastive_weight: 100.0
+  classification_weight: 10.0
+  decoder_weight: 1.0
+  asl_gamma_negative: 4.0
+  asl_gamma_positive: 1.0
+  asl_clip: 0.05
+  gather_contrastive_features: true
+
+train:
+  epochs: 10
+  batch_size_per_gpu: 96
+  expected_world_size: 2
+  global_batch_size: 192
+  effective_batch_size: 192
+  eval_batch_size_per_gpu: 128
+  gradient_accumulation_steps: 1
+  precision: bf16
+  gradient_checkpointing: false
+  gradient_clip_norm: 1.0
+  optimizer: adamw
+  learning_rate: 1.0e-5           # CLIP 预训练 backbone 微调 LR（encoder）
+  gate_learning_rate: 1.0e-4      # gate 头随机初始化，用 10 倍 LR 加快收敛
+  min_learning_rate: 1.0e-6
+  warmup_steps: 1000
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.98
+  eps: 1.0e-6
+  scheduler: cosine
+  save_last: true
+  save_epoch_weights: true
+  selection_metric: last_epoch
+
+distributed:
+  enabled: true
+  backend: nccl
+  devices: [1, 2]                 # 仅记录；实际由 CUDA_VISIBLE_DEVICES 决定
+  nproc_per_node: 2
+  find_unused_parameters: false
+  broadcast_buffers: false

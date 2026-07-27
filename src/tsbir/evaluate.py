@@ -53,21 +53,54 @@ class CaptionDataset(Dataset):
         return tokenize(caption)[0], record_index, caption
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> CLIP:
+def load_model(checkpoint_path: Path, device: torch.device, feature_fusion: str = "auto") -> CLIP:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=False)
+    state_dict = checkpoint["state_dict"]
+    if next(iter(state_dict)).startswith("module."):
+        state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
+
+    state_fusion = "gate" if any(key.startswith("gate.") for key in state_dict) else "avg"
+    saved_fusion = checkpoint.get("config", {}).get("model", {}).get("feature_fusion")
+    if saved_fusion is not None and saved_fusion != state_fusion:
+        raise RuntimeError(
+            f"checkpoint metadata says feature_fusion={saved_fusion!r}, "
+            f"but its state_dict implies {state_fusion!r}"
+        )
+    checkpoint_fusion = saved_fusion or state_fusion
+    if feature_fusion != "auto" and feature_fusion != checkpoint_fusion:
+        raise ValueError(
+            f"--feature-fusion={feature_fusion!r} does not match checkpoint "
+            f"fusion mode {checkpoint_fusion!r}"
+        )
+
+    resolved_fusion = checkpoint_fusion if feature_fusion == "auto" else feature_fusion
+    saved_model_config = checkpoint.get("config", {}).get("model", {})
+    gate_hidden_dim = int(saved_model_config.get("gate_hidden_dim", 256))
+    if resolved_fusion == "gate" and "gate.0.weight" in state_dict:
+        state_hidden_dim = int(state_dict["gate.0.weight"].shape[0])
+        if "gate_hidden_dim" in saved_model_config and gate_hidden_dim != state_hidden_dim:
+            raise RuntimeError(
+                f"checkpoint gate_hidden_dim metadata is {gate_hidden_dim}, "
+                f"but gate.0.weight implies {state_hidden_dim}"
+            )
+        gate_hidden_dim = state_hidden_dim
+
     with (REPO_ROOT / "code" / "training" / "model_configs" / "ViT-B-16.json").open() as handle:
         config = json.load(handle)
     model = CLIP(
         **config,
         weight_sharing=True,
-        feature_fusion="avg",
+        feature_fusion=resolved_fusion,
         num_class=90,
         normalize_fused_query=True,
+        gate_hidden_dim=gate_hidden_dim,
     )
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=False)
-    state_dict = checkpoint["state_dict"]
-    if next(iter(state_dict)).startswith("module."):
-        state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
     model.load_state_dict(state_dict, strict=True)
+    print(
+        f"[load_model] feature_fusion={resolved_fusion}, loaded {len(state_dict)} tensors "
+        f"from {checkpoint_path}",
+        flush=True,
+    )
     return model.to(device).eval()
 
 
@@ -109,6 +142,18 @@ def metrics(ranks: list[int]) -> dict[str, float | int]:
         "MRR": float(np.mean(1.0 / values)),
         "median_rank": float(np.median(values)),
         "mean_rank": float(np.mean(values)),
+    }
+
+
+def alpha_metrics(rows: list[dict[str, Any]]) -> dict[str, float | int]:
+    values = np.asarray([row["alpha"] for row in rows], dtype=np.float32)
+    return {
+        "queries": int(values.size),
+        "mean": float(values.mean()),
+        "std": float(values.std()),
+        "p10": float(np.quantile(values, 0.1)),
+        "p50": float(np.quantile(values, 0.5)),
+        "p90": float(np.quantile(values, 0.9)),
     }
 
 
@@ -223,6 +268,12 @@ def main() -> None:
         help="manifest field used as the sketch query source (human_sketch or synthetic_sketch)",
     )
     parser.add_argument(
+        "--feature-fusion",
+        default="auto",
+        choices=["auto", "avg", "gate"],
+        help="query fusion mode; auto detects it from the checkpoint and rejects mismatches",
+    )
+    parser.add_argument(
         "--render-only",
         action="store_true",
         help="redraw case images from existing *_top5.jsonl files without evaluating the model",
@@ -239,7 +290,7 @@ def main() -> None:
         return
 
     device = torch.device("cuda", 0)
-    model = load_model(args.checkpoint, device)
+    model = load_model(args.checkpoint, device, feature_fusion=args.feature_fusion)
 
     print("encoding 5k image gallery", flush=True)
     gallery = encode_visual(
@@ -265,10 +316,18 @@ def main() -> None:
         empty_text_feature = F.normalize(model.encode_text(empty_tokens).float(), dim=-1)
 
     target_indices = torch.arange(len(records), device=device)
-    sketch_query = F.normalize((sketch_features + empty_text_feature) / 2.0, dim=-1)
-    sketch_ranks, sketch_top = ranks_and_top_five(sketch_query, gallery, target_indices)
+    with torch.inference_mode():
+        sketch_query, sketch_alpha = model.feature_fuse(
+            empty_text_feature,
+            sketch_features,
+            return_alpha=True,
+        )
+        sketch_ranks, sketch_top = ranks_and_top_five(sketch_query, gallery, target_indices)
+    sketch_alphas = sketch_alpha.flatten().cpu().tolist()
     mode_rows: dict[str, list[dict[str, Any]]] = {"sketch": [], "text": [], "mixed": []}
-    for record_index, (rank, top_indices) in enumerate(zip(sketch_ranks, sketch_top)):
+    for record_index, (rank, top_indices, alpha) in enumerate(
+        zip(sketch_ranks, sketch_top, sketch_alphas)
+    ):
         record = records[record_index]
         mode_rows["sketch"].append(
             {
@@ -276,6 +335,7 @@ def main() -> None:
                 "record_index": record_index,
                 "coco_id": int(record["coco_id"]),
                 "caption": "",
+                "alpha": alpha,
                 "rank": rank,
                 "top5_indices": top_indices,
                 "top5_coco_ids": [int(records[index]["coco_id"]) for index in top_indices],
@@ -297,13 +357,25 @@ def main() -> None:
             text_features = F.normalize(model.encode_text(tokens.to(device, non_blocking=True)).float(), dim=-1)
             current_sketches = sketch_features[record_indices_gpu]
             queries = {
-                "text": F.normalize((text_features + blank_sketch_feature) / 2.0, dim=-1),
-                "mixed": F.normalize((text_features + current_sketches) / 2.0, dim=-1),
+                "text": model.feature_fuse(
+                    text_features,
+                    blank_sketch_feature,
+                    return_alpha=True,
+                ),
+                "mixed": model.feature_fuse(
+                    text_features,
+                    current_sketches,
+                    return_alpha=True,
+                ),
             }
-            for mode, query in queries.items():
+            for mode, (query, alpha) in queries.items():
                 current_ranks, current_top = ranks_and_top_five(query, gallery, record_indices_gpu)
-                for record_index, caption, rank, top_indices in zip(
-                    record_indices.tolist(), captions, current_ranks, current_top
+                for record_index, caption, rank, top_indices, alpha_value in zip(
+                    record_indices.tolist(),
+                    captions,
+                    current_ranks,
+                    current_top,
+                    alpha.flatten().cpu().tolist(),
                 ):
                     record = records[record_index]
                     mode_rows[mode].append(
@@ -312,6 +384,7 @@ def main() -> None:
                             "record_index": record_index,
                             "coco_id": int(record["coco_id"]),
                             "caption": caption,
+                            "alpha": alpha_value,
                             "rank": rank,
                             "top5_indices": top_indices,
                             "top5_coco_ids": [int(records[index]["coco_id"]) for index in top_indices],
@@ -319,8 +392,11 @@ def main() -> None:
                     )
 
     all_metrics = {mode: metrics([row["rank"] for row in rows]) for mode, rows in mode_rows.items()}
+    all_alpha_metrics = {mode: alpha_metrics(rows) for mode, rows in mode_rows.items()}
     with (args.output / "metrics.json").open("w") as handle:
         json.dump(all_metrics, handle, indent=2)
+    with (args.output / "alpha_metrics.json").open("w") as handle:
+        json.dump(all_alpha_metrics, handle, indent=2)
     for mode, rows in mode_rows.items():
         save_results(rows, args.output / f"{mode}_top5.jsonl")
         successes = [row for row in rows if row["rank"] == 1][:3]
@@ -328,7 +404,7 @@ def main() -> None:
         for case_type, cases in (("success", successes), ("failure", failures)):
             for index, row in enumerate(cases, 1):
                 case_grid(row, records, args.output / "cases" / f"{mode}_{case_type}_{index}.jpg", args.sketch_field)
-    print(json.dumps(all_metrics, indent=2), flush=True)
+    print(json.dumps({"retrieval": all_metrics, "alpha": all_alpha_metrics}, indent=2), flush=True)
 
 
 if __name__ == "__main__":
