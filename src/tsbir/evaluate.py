@@ -76,6 +76,7 @@ def load_model(checkpoint_path: Path, device: torch.device, feature_fusion: str 
     resolved_fusion = checkpoint_fusion if feature_fusion == "auto" else feature_fusion
     saved_model_config = checkpoint.get("config", {}).get("model", {})
     gate_hidden_dim = int(saved_model_config.get("gate_hidden_dim", 256))
+    gate_mixed_only = bool(saved_model_config.get("gate_mixed_only", False))
     if resolved_fusion == "gate" and "gate.0.weight" in state_dict:
         state_hidden_dim = int(state_dict["gate.0.weight"].shape[0])
         if "gate_hidden_dim" in saved_model_config and gate_hidden_dim != state_hidden_dim:
@@ -94,6 +95,7 @@ def load_model(checkpoint_path: Path, device: torch.device, feature_fusion: str 
         num_class=90,
         normalize_fused_query=True,
         gate_hidden_dim=gate_hidden_dim,
+        gate_mixed_only=gate_mixed_only,
     )
     model.load_state_dict(state_dict, strict=True)
     print(
@@ -274,6 +276,11 @@ def main() -> None:
         help="query fusion mode; auto detects it from the checkpoint and rejects mismatches",
     )
     parser.add_argument(
+        "--gate-checkpoint",
+        type=Path,
+        help="optional small gate-only checkpoint overlaid after loading the full model",
+    )
+    parser.add_argument(
         "--render-only",
         action="store_true",
         help="redraw case images from existing *_top5.jsonl files without evaluating the model",
@@ -291,6 +298,19 @@ def main() -> None:
 
     device = torch.device("cuda", 0)
     model = load_model(args.checkpoint, device, feature_fusion=args.feature_fusion)
+    if args.gate_checkpoint is not None:
+        if model.feature_fusion != "gate":
+            raise ValueError("--gate-checkpoint requires a gate-enabled full checkpoint")
+        gate_checkpoint = torch.load(
+            args.gate_checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+        gate_state_dict = gate_checkpoint.get("gate_state_dict")
+        if gate_state_dict is None:
+            raise RuntimeError(f"{args.gate_checkpoint} has no gate_state_dict")
+        model.gate.load_state_dict(gate_state_dict, strict=True)
+        print(f"[load_model] overlaid gate parameters from {args.gate_checkpoint}", flush=True)
 
     print("encoding 5k image gallery", flush=True)
     gallery = encode_visual(
@@ -317,11 +337,19 @@ def main() -> None:
 
     target_indices = torch.arange(len(records), device=device)
     with torch.inference_mode():
-        sketch_query, sketch_alpha = model.feature_fuse(
-            empty_text_feature,
-            sketch_features,
-            return_alpha=True,
-        )
+        if model.feature_fusion == "gate" and model.gate_mixed_only:
+            sketch_query = sketch_features
+            sketch_alpha = torch.zeros(
+                (sketch_features.shape[0], 1),
+                device=sketch_features.device,
+                dtype=sketch_features.dtype,
+            )
+        else:
+            sketch_query, sketch_alpha = model.feature_fuse(
+                empty_text_feature,
+                sketch_features,
+                return_alpha=True,
+            )
         sketch_ranks, sketch_top = ranks_and_top_five(sketch_query, gallery, target_indices)
     sketch_alphas = sketch_alpha.flatten().cpu().tolist()
     mode_rows: dict[str, list[dict[str, Any]]] = {"sketch": [], "text": [], "mixed": []}
@@ -356,12 +384,21 @@ def main() -> None:
             record_indices_gpu = record_indices.to(device, non_blocking=True)
             text_features = F.normalize(model.encode_text(tokens.to(device, non_blocking=True)).float(), dim=-1)
             current_sketches = sketch_features[record_indices_gpu]
-            queries = {
-                "text": model.feature_fuse(
+            if model.feature_fusion == "gate" and model.gate_mixed_only:
+                text_alpha = torch.ones(
+                    (text_features.shape[0], 1),
+                    device=text_features.device,
+                    dtype=text_features.dtype,
+                )
+                text_query = (text_features, text_alpha)
+            else:
+                text_query = model.feature_fuse(
                     text_features,
                     blank_sketch_feature,
                     return_alpha=True,
-                ),
+                )
+            queries = {
+                "text": text_query,
                 "mixed": model.feature_fuse(
                     text_features,
                     current_sketches,

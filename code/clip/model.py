@@ -265,6 +265,7 @@ class CLIP(nn.Module):
                  normalize_fused_query: bool = True,
                  gate_hidden_dim: int = 256,
                  gate_alpha_init: float = 0.5,
+                 gate_mixed_only: bool = False,
                  ):
         super().__init__()
         #set default to weight sharing
@@ -274,6 +275,11 @@ class CLIP(nn.Module):
         self.weight_sharing = weight_sharing
         self.feature_fusion = feature_fusion
         self.normalize_fused_query = normalize_fused_query
+        # A gate trained in the frozen-encoder second stage only sees queries
+        # where both modalities are present.  Evaluation uses this metadata to
+        # hard-bypass the gate for text-only and sketch-only queries.  The
+        # default keeps legacy/joint-gate checkpoints behavior unchanged.
+        self.gate_mixed_only = gate_mixed_only
         self.context_length = context_length
 
         if isinstance(vision_layers, (tuple, list)):

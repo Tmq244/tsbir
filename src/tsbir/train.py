@@ -66,6 +66,7 @@ def load_model(config: dict, device: torch.device) -> CLIP:
         normalize_fused_query=bool(config["model"].get("normalize_fused_query", True)),
         gate_hidden_dim=int(config["model"].get("gate_hidden_dim", 256)),
         gate_alpha_init=float(config["model"].get("gate_alpha_init", 0.5)),
+        gate_mixed_only=bool(config["model"].get("gate_mixed_only", False)),
     )
     init_mode = config["model"].get("init", "official_taskformer")
     if init_mode == "official_taskformer":
