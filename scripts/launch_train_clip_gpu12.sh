@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # Launch CLIP-pretrained training (10 epochs) on physical GPU 1,2 inside a tmux session.
 set -euo pipefail
-cd /home/tangmingqiang/cir/tsbir
-source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate tsbir
+cd "$(dirname "$0")/.."
 export CUDA_VISIBLE_DEVICES=1,2
-export PYTHONPATH=src:code
+export PYTHONPATH="src:code${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=8
 mkdir -p outputs
 echo "[$(date --iso-8601=seconds)] starting CLIP-pretrained training on GPU 1,2 (gradient_checkpointing=false)"

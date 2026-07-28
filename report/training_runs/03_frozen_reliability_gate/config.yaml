@@ -1,0 +1,46 @@
+experiment:
+  name: taskformer_coco_clip_avg_frozen_gate_grid_3ep_gpu45
+  seed: 2026
+  output_dir: outputs/taskformer_coco_clip_avg_frozen_gate_grid_3ep_gpu45
+
+data:
+  train_manifest: data/processed/manifests/train.jsonl
+  train_pairs_per_epoch: 566747
+  image_size: 224
+  workers_per_gpu: 6
+
+model:
+  architecture: ViT-B-16
+  weight_sharing: true
+  feature_fusion: gate
+  gate_mixed_only: true
+  gate_hidden_dim: 256
+  gate_alpha_init: 0.5
+  num_classes: 90
+  source_checkpoint: outputs/taskformer_coco_clip_10ep_gpu12_bs96/last_weights.pt
+
+teacher:
+  # The target is the soft expected alpha under per-grid in-batch retrieval loss.
+  alpha_grid: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  temperature: 0.1
+  confidence_floor: 0.1
+
+loss:
+  retrieval_weight: 1.0
+  reliability_weight: 1.0
+
+train:
+  epochs: 3
+  batch_size_per_gpu: 192
+  expected_world_size: 2
+  precision: bf16
+  learning_rate: 1.0e-4
+  min_learning_rate: 1.0e-5
+  warmup_steps: 100
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.98
+  eps: 1.0e-6
+  gradient_clip_norm: 1.0
+  log_every_steps: 20
+

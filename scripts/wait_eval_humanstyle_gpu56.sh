@@ -2,10 +2,8 @@
 # Wait for the formal C2 epoch-10 checkpoint, then evaluate human and
 # synthetic sketches on the released training GPUs.
 set -euo pipefail
-cd /home/tangmingqiang/cir/tsbir
-source /home/tangmingqiang/miniconda3/etc/profile.d/conda.sh
-conda activate tsbir
-export PYTHONPATH=src:code
+cd "$(dirname "$0")/.."
+export PYTHONPATH="src:code${PYTHONPATH:+:$PYTHONPATH}"
 
 readonly checkpoint=outputs/taskformer_coco_clip_humanstyle_consistency_10ep_auto2gpu/epoch_010_weights.pt
 readonly config_pattern='tsbir.train --config configs/train_coco_clip_humanstyle_consistency_10ep_auto2gpu.yaml'

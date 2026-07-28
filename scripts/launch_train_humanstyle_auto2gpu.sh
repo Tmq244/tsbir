@@ -3,9 +3,7 @@
 # then launch the formal 10-epoch experiment on those same physical GPUs.
 set -euo pipefail
 
-cd /home/tangmingqiang/cir/tsbir
-source /home/tangmingqiang/miniconda3/etc/profile.d/conda.sh
-conda activate tsbir
+cd "$(dirname "$0")/.."
 
 readonly minimum_free_mib=30720
 readonly poll_seconds=60
@@ -59,7 +57,7 @@ if [[ -e "$output_dir/epoch_001_weights.pt" ]]; then
 fi
 
 export CUDA_VISIBLE_DEVICES="$selected_pair"
-export PYTHONPATH=src:code
+export PYTHONPATH="src:code${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=8
 echo "[$(date --iso-8601=seconds)] selected physical GPUs ${selected_pair}"
 nvidia-smi --query-gpu=index,memory.used,memory.free,utilization.gpu --format=csv,noheader

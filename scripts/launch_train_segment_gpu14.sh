@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # Launch experiment B (skeleton-segment dropout) on physical GPUs 1 and 4.
 set -euo pipefail
-cd /home/tangmingqiang/cir/tsbir
-source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate tsbir
+cd "$(dirname "$0")/.."
 export CUDA_VISIBLE_DEVICES=1,4
-export PYTHONPATH=src:code
+export PYTHONPATH="src:code${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=8
 mkdir -p outputs
 echo "[$(date --iso-8601=seconds)] starting segment-dropout B on GPU 1,4"

@@ -1,3 +1,5 @@
+# TASK-former 完整复现技术说明
+
 这个项目目前已经形成了一个完整的 TASK-former 复现闭环：
 
 > COCO 数据下载 → 人工/合成草图整理 → 三模态模型微调 → 草图/文本/混合检索 → 指标统计 → 成功失败案例输出
@@ -40,8 +42,8 @@ $$
 
 主要包括：
 
-- [README.md](/home/tangmingqiang/cir/tsbir/README.md)
-- [Retrieval_Demo.ipynb](/home/tangmingqiang/cir/tsbir/notebooks/Retrieval_Demo.ipynb)
+- [README.md](../README.md)
+- [Retrieval_Demo.ipynb](../notebooks/Retrieval_Demo.ipynb)
 - `images/`：100 张示例图库图片
 - `sketches/`：示例查询草图
 - `model/tsbir_model_final.pt`：官方预训练模型
@@ -59,7 +61,7 @@ Notebook 的流程是预提取 100 张图片的特征，再用文本和草图的
 - `data/`：完整 COCO 数据和草图
 - `outputs/`：训练权重、日志、指标和案例图
 
-需要注意：从 Git 状态看，`src/`、`configs/`、`scripts/` 等目前仍是未提交文件，README 也还没有更新为完整训练版说明。
+完整复现代码位于 `src/`、`configs/` 和 `scripts/`，英文项目入口及可复现命令见根目录 README。
 
 ---
 
@@ -77,8 +79,8 @@ Notebook 的流程是预提取 100 张图片的特征，再用文本和草图的
 
 下载入口是：
 
-- [download_coco.sh](/home/tangmingqiang/cir/tsbir/scripts/download_coco.sh)
-- [download_photosketch.sh](/home/tangmingqiang/cir/tsbir/scripts/download_photosketch.sh)
+- [download_coco.sh](../scripts/download_coco.sh)
+- [download_photosketch.sh](../scripts/download_photosketch.sh)
 
 ### 数据规模
 
@@ -94,12 +96,12 @@ Notebook 的流程是预提取 100 张图片的特征，再用文本和草图的
 
 - 123,287 张合成草图；
 - 5,000 张人工测试草图；
-- 90 维 COCO 多标签；
+- 80 个 COCO 语义类别，按原始 category ID 存入 90 维多标签向量；
 - `data/` 目录约 42 GB。
 
 ### Manifest 结构
 
-[prepare_data.py](/home/tangmingqiang/cir/tsbir/src/tsbir/prepare_data.py) 将不同来源的数据统一成 JSONL。每条记录包含：
+[prepare_data.py](../src/tsbir/prepare_data.py) 将不同来源的数据统一成 JSONL。每条记录包含：
 
 ```json
 {
@@ -118,7 +120,7 @@ Notebook 的流程是预提取 100 张图片的特征，再用文本和草图的
 
 ## 4. 数据增强
 
-数据集实现在 [data.py](/home/tangmingqiang/cir/tsbir/src/tsbir/data.py:102)。
+数据集实现在 [data.py](../src/tsbir/data.py#L102)。
 
 图像和草图都会独立执行：
 
@@ -146,7 +148,7 @@ Notebook 的流程是预提取 100 张图片的特征，再用文本和草图的
 
 ## 5. 模型结构
 
-核心模型位于 [model.py](/home/tangmingqiang/cir/tsbir/code/clip/model.py:247)，基础骨干是 CLIP ViT-B/16：
+核心模型位于 [model.py](../code/clip/model.py#L247)，基础骨干是 CLIP ViT-B/16：
 
 - 输入分辨率：224×224；
 - patch 大小：16×16；
@@ -202,7 +204,7 @@ self.visual2 = self.visual
 
 ## 6. 三个训练损失
 
-训练核心位于 [train.py](/home/tangmingqiang/cir/tsbir/src/tsbir/train.py:221)。
+训练核心位于 [train.py](../src/tsbir/train.py#L221)。
 
 ### 对比检索损失 \(L_e\)
 
@@ -223,11 +225,11 @@ $$
 
 既要求查询找到图像，也要求图像找到查询。文本、草图和图像特征会先分别归一化；融合 query 再次归一化后，训练 logits 是严格的 cosine similarity，并且与评测路径保持一致。
 
-DDP 训练时会通过 `all_gather` 收集所有 GPU 的特征，使负样本范围扩展到跨全部 rank 的全局 batch，实现在 [losses.py](/home/tangmingqiang/cir/tsbir/src/tsbir/losses.py:43)。这不局限于两张 GPU，实际 GPU 数由 `torchrun` 的 `WORLD_SIZE` 决定。
+DDP 训练时会通过 `all_gather` 收集所有 GPU 的特征，使负样本范围扩展到跨全部 rank 的全局 batch，实现在 [losses.py](../src/tsbir/losses.py#L43)。这不局限于两张 GPU，实际 GPU 数由 `torchrun` 的 `WORLD_SIZE` 决定。
 
 ### 全局唯一图像批采样
 
-[DistributedUniqueImageBatchSampler](/home/tangmingqiang/cir/tsbir/src/tsbir/data.py:165) 保留 566,747 个 caption pair，并按照每张图剩余的 caption 数构造 batch。某张图只有在当前全局 batch 完成后才会重新进入候选队列，因此：
+[DistributedUniqueImageBatchSampler](../src/tsbir/data.py#L165) 保留 566,747 个 caption pair，并按照每张图剩余的 caption 数构造 batch。某张图只有在当前全局 batch 完成后才会重新进入候选队列，因此：
 
 - 单卡局部 batch 内不会重复图像；
 - 多卡 `all_gather` 后的全局 batch 内也不会重复图像；
@@ -238,7 +240,7 @@ DDP 训练时会通过 `all_gather` 收集所有 GPU 的特征，使负样本范
 
 ### 多标签分类损失 \(L_c\)
 
-分别对图像、草图、文本预测 90 维 COCO 类别，再取平均：
+分别对图像、草图、文本预测 90 维多标签向量（对应 80 个有效 COCO 类别），再取平均：
 
 $$
 L_c=\frac{L_\text{img}+L_\text{sketch}+L_\text{text}}{3}
@@ -270,7 +272,7 @@ $$
 
 ## 7. 训练策略
 
-10 epoch 主实验配置见 [finetune_coco_ddp_10ep_gpu23.yaml](/home/tangmingqiang/cir/tsbir/configs/finetune_coco_ddp_10ep_gpu23.yaml)。
+10 epoch 主实验配置见 [finetune_coco_ddp_10ep_gpu23.yaml](../configs/finetune_coco_ddp_10ep_gpu23.yaml)。
 
 主要参数：
 
@@ -331,7 +333,7 @@ $$
 
 默认选择最后一个 epoch，而不是根据合成验证集选择 `best_weights.pt`。评测脚本默认读取 `outputs/taskformer_coco_official_finetune/last_weights.pt`。
 
-完整流水线入口是 [run_training_pipeline_2gpu.sh](/home/tangmingqiang/cir/tsbir/scripts/run_training_pipeline_2gpu.sh)，依次执行：
+完整流水线入口是 [run_training_pipeline_2gpu.sh](../scripts/run_training_pipeline_2gpu.sh)，依次执行：
 
 1. 等待 COCO 数据准备完成；
 2. 生成 manifest；
@@ -362,13 +364,13 @@ $$
 
 生成的损失曲线位于：
 
-[loss_curves_10epochs.png](/home/tangmingqiang/cir/tsbir/outputs/taskformer_coco_official_finetune_10ep_gpu23_bs96/loss_curves_10epochs.png)
+[loss_curves_10epochs.png](../outputs/taskformer_coco_official_finetune_10ep_gpu23_bs96/loss_curves_10epochs.png)
 
 ---
 
 ## 9. 三种检索如何评测
 
-评测代码位于 [evaluate.py](/home/tangmingqiang/cir/tsbir/src/tsbir/evaluate.py:155)。
+评测代码位于 [evaluate.py](../src/tsbir/evaluate.py#L155)。
 
 测试图库固定为 5000 张 COCO 图像：
 
@@ -452,14 +454,12 @@ Decoder loss 长期在 3.0 附近，后期改善很小，却占用大量参数�
 
 数据仍以 caption 为样本单位，但当前全局批采样器保证同一图像不会在一次对比损失的全局 batch 中出现两次，因此不会再把同图不同 caption 当作负样本。如果未来绕过该采样器或允许同图重复，则必须改用基于 `coco_id` 的多正样本对比损失。
 
-### 工程可复现性仍需收尾
+### 工程使用注意事项
 
-- README 仍只介绍旧 Demo；
-- 训练扩展代码尚未提交；
-- `outputs/` 约 18 GB；
-- 缺少自动化测试；
-- 训练脚本绑定特定 GPU 编号；
-- 新采样与增强代码已通过语法、配置和真实 manifest 不变量测试，但尚未重新执行完整 GPU 训练。
+- `outputs/` 包含完整模型和优化器 checkpoint，占用空间较大；
+- 部分历史 launcher 记录了实验服务器的特定 GPU 编号，跨机器运行时应使用根目录 README 中的通用命令；
+- 当前自动化测试主要覆盖草图增强，完整训练与评测仍需要 GPU 集成测试；
+- 配置、训练日志、最终权重和评测指标均已保存在对应实验目录中。
 
 ---
 

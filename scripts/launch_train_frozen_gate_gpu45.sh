@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/tangmingqiang/cir/tsbir
-source /home/tangmingqiang/miniconda3/etc/profile.d/conda.sh
-conda activate tsbir
+cd "$(dirname "$0")/.."
 
 export CUDA_VISIBLE_DEVICES=4,5
-export PYTHONPATH=src:code
+export PYTHONPATH="src:code${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=8
 
 mkdir -p outputs

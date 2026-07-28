@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # Launch the formal C2 run on physical GPUs 5 and 6 after a full-batch smoke.
 set -euo pipefail
-cd /home/tangmingqiang/cir/tsbir
-source /home/tangmingqiang/miniconda3/etc/profile.d/conda.sh
-conda activate tsbir
+cd "$(dirname "$0")/.."
 export CUDA_VISIBLE_DEVICES=5,6
-export PYTHONPATH=src:code
+export PYTHONPATH="src:code${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=8
 mkdir -p outputs
 echo "[$(date --iso-8601=seconds)] starting formal human-style consistency training on GPU 5,6"
