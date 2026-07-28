@@ -51,6 +51,10 @@ The five formal training records are stored under [`report/training_runs/`](repo
 
 Each directory contains `config.yaml`, `training.log`, `train.csv`, `epoch_summary.csv`, and `loss_curves.png`. Smoke tests and aborted runs are excluded.
 
+## Model weights
+
+The five final checkpoints are available from the [ModelScope model repository](https://www.modelscope.cn/models/tmq244/image-retrieval-text-sketch).
+
 ## Repository layout
 
 ```text
