@@ -248,6 +248,8 @@ def main() -> None:
         image_size=int(config["data"]["image_size"]),
         training=True,
         sketch_dropout_mode=config["data"].get("sketch_dropout_mode", "pixel"),
+        sketch_views=int(config["data"].get("sketch_views", 1)),
+        human_style_config=config["data"].get("human_style"),
     )
     expected_pairs = int(config["data"]["train_pairs_per_epoch"])
     if len(dataset) != expected_pairs:
@@ -304,6 +306,11 @@ def main() -> None:
         float(config["loss"]["asl_gamma_positive"]),
         float(config["loss"]["asl_clip"]),
     )
+    consistency_weight = float(config["loss"].get("consistency_weight", 0.0))
+    if consistency_weight < 0.0:
+        raise ValueError(f"loss.consistency_weight must be non-negative, got {consistency_weight}")
+    if consistency_weight > 0.0 and int(config["data"].get("sketch_views", 1)) != 2:
+        raise ValueError("positive consistency_weight requires data.sketch_views=2")
 
     writer = SummaryWriter(output_dir / "tensorboard") if rank == 0 else None
     csv_file = (output_dir / "train.csv").open("w", newline="") if rank == 0 else None
@@ -311,7 +318,8 @@ def main() -> None:
     if csv_writer:
         csv_writer.writerow(
             [
-                "epoch", "step", "loss", "embedding", "classification", "decoder",
+                "epoch", "step", "loss", "embedding", "classification", "decoder", "consistency",
+                "sketch_keep_ratio", "sketch_view2_keep_ratio",
                 "lr", "gate_lr", "alpha_mean", "alpha_std", "alpha_p10", "alpha_p50",
                 "alpha_p90", "seconds",
             ]
@@ -331,15 +339,28 @@ def main() -> None:
             sync_step = (batch_index + 1) % accumulation == 0
             sync_context = contextlib.nullcontext() if sync_step or world_size == 1 else ddp.no_sync()
             with sync_context, torch.autocast("cuda", dtype=torch.bfloat16):
-                image_features, text_features, sketch_features = ddp(
+                second_sketch = batch.get("sketch_view2")
+                encoded_features = ddp(
                     batch["image"].to(device, non_blocking=True),
                     batch["text_tokens"].to(device, non_blocking=True),
                     batch["sketch"].to(device, non_blocking=True),
+                    sketch2=(
+                        second_sketch.to(device, non_blocking=True)
+                        if second_sketch is not None
+                        else None
+                    ),
                     return_all_features=True,
                 )
+                if second_sketch is None:
+                    image_features, text_features, sketch_features = encoded_features
+                    second_sketch_features = None
+                else:
+                    image_features, text_features, sketch_features, second_sketch_features = encoded_features
                 image_features = image_features.float()
                 text_features = text_features.float()
                 sketch_features = sketch_features.float()
+                if second_sketch_features is not None:
+                    second_sketch_features = second_sketch_features.float()
                 query_features, fusion_alpha = module.feature_fuse(
                     text_features,
                     sketch_features,
@@ -364,10 +385,21 @@ def main() -> None:
                     caption_tokens[:, 1:],
                     ignore_index=0,
                 )
+                consistency = sketch_features.new_zeros(())
+                if second_sketch_features is not None:
+                    sketch_present = batch["sketch_present"].to(device, non_blocking=True).bool()
+                    per_sample_consistency = 1.0 - F.cosine_similarity(
+                        sketch_features,
+                        second_sketch_features,
+                        dim=-1,
+                    )
+                    if sketch_present.any():
+                        consistency = per_sample_consistency[sketch_present].mean()
                 loss = (
                     float(config["loss"]["contrastive_weight"]) * embedding
                     + float(config["loss"]["classification_weight"]) * classification
                     + float(config["loss"]["decoder_weight"]) * decoder
+                    + consistency_weight * consistency
                 )
                 (loss / accumulation).backward()
 
@@ -381,7 +413,10 @@ def main() -> None:
             module.logit_scale.data.clamp_(0, math.log(100.0))
 
             if rank == 0 and (global_step == 1 or global_step % 20 == 0):
-                values = [float(x.detach()) for x in (loss, embedding, classification, decoder)]
+                values = [
+                    float(x.detach())
+                    for x in (loss, embedding, classification, decoder, consistency)
+                ]
                 elapsed = time.time() - started
                 lr = optimizer.param_groups[0]["lr"]
                 gate_lr_value = next(
@@ -397,23 +432,47 @@ def main() -> None:
                         torch.tensor([0.1, 0.5, 0.9], device=alpha_values.device),
                     )
                 )
+                present_for_logging = batch["sketch_present"].bool()
+                keep_ratio = batch.get("sketch_keep_ratio")
+                second_keep_ratio = batch.get("sketch_view2_keep_ratio")
+                if keep_ratio is not None and present_for_logging.any():
+                    keep_ratio_value = float(keep_ratio[present_for_logging].float().mean())
+                    second_keep_ratio_value = float(
+                        second_keep_ratio[present_for_logging].float().mean()
+                    )
+                else:
+                    keep_ratio_value = 1.0
+                    second_keep_ratio_value = 1.0
                 print(
                     f"epoch={epoch + 1} step={global_step}/{total_updates} "
                     f"loss={values[0]:.4f} Le={values[1]:.4f} Lc={values[2]:.4f} "
-                    f"Ld={values[3]:.4f} lr={lr:.3e} gate_lr={gate_lr_value:.3e} "
+                    f"Ld={values[3]:.4f} Lcons={values[4]:.4f} "
+                    f"keep={keep_ratio_value:.3f}/{second_keep_ratio_value:.3f} "
+                    f"lr={lr:.3e} gate_lr={gate_lr_value:.3e} "
                     f"alpha={alpha_mean:.3f}+/-{alpha_std:.3f} "
                     f"peak_mem={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB",
                     flush=True,
                 )
                 csv_writer.writerow(
                     [
-                        epoch + 1, global_step, *values, lr, gate_lr_value,
+                        epoch + 1, global_step, *values,
+                        keep_ratio_value, second_keep_ratio_value,
+                        lr, gate_lr_value,
                         alpha_mean, alpha_std, alpha_p10, alpha_p50, alpha_p90, elapsed,
                     ]
                 )
                 csv_file.flush()
-                for name, value in zip(("total", "embedding", "classification", "decoder"), values):
+                for name, value in zip(
+                    ("total", "embedding", "classification", "decoder", "consistency"),
+                    values,
+                ):
                     writer.add_scalar(f"loss/{name}", value, global_step)
+                writer.add_scalar("augmentation/sketch_keep_ratio", keep_ratio_value, global_step)
+                writer.add_scalar(
+                    "augmentation/sketch_view2_keep_ratio",
+                    second_keep_ratio_value,
+                    global_step,
+                )
                 writer.add_scalar("train/lr", lr, global_step)
                 writer.add_scalar("train/gate_lr", gate_lr_value, global_step)
                 writer.add_scalar("fusion/alpha_mean", alpha_mean, global_step)

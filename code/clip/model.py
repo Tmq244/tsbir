@@ -478,17 +478,22 @@ class CLIP(nn.Module):
                 param.requires_grad = True
                 
         return
-    def forward(self, image, text, sketch, return_all_features=False):
+    def forward(self, image, text, sketch, sketch2=None, return_all_features=False):
        
         image_features = self.encode_image(image)
         text_features = self.encode_text(text)
         sketch_features = self.encode_sketch(sketch)
+        sketch2_features = self.encode_sketch(sketch2) if sketch2 is not None else None
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         sketch_features = sketch_features / sketch_features.norm(dim=-1, keepdim=True)
+        if sketch2_features is not None:
+            sketch2_features = sketch2_features / sketch2_features.norm(dim=-1, keepdim=True)
 
         if return_all_features:
+            if sketch2_features is not None:
+                return image_features, text_features, sketch_features, sketch2_features
             return image_features, text_features, sketch_features
         
         fused_feature = self.feature_fuse(text_features,sketch_features)

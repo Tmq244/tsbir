@@ -22,6 +22,7 @@ from torchvision.transforms import (
     Resize,
     ToTensor,
 )
+from torchvision.transforms import functional as transform_functional
 
 from clip.clip import tokenize
 
@@ -269,6 +270,296 @@ def stroke_segment_dropout(
     return Image.fromarray(gray, mode="L")
 
 
+DEFAULT_HUMAN_STYLE_CONFIG = {
+    "minimum_keep": 0.6,
+    "width_probability": 0.35,
+    "elastic_probability": 0.30,
+    "elastic_amplitude": [1.0, 4.0],
+    "elastic_sigma": [8.0, 16.0],
+    "gap_probability": 0.30,
+    "gap_count": [1, 4],
+    "gap_length": [4.0, 16.0],
+    "gap_width": [2.0, 6.0],
+    "simplify_probability": 0.20,
+    "simplify_scale": [0.55, 0.85],
+    "small_structure_probability": 0.15,
+    "small_segment_maximum_length": 24,
+    "segment_probability": 0.10,
+    "maximum_segment_length": 64,
+    "maximum_structural_area_ratio": 0.10,
+}
+
+
+def _probability(config: dict[str, Any], key: str) -> bool:
+    probability = float(config[key])
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError(f"{key} must be in [0, 1], got {probability}")
+    return random.random() < probability
+
+
+def _range_pair(config: dict[str, Any], key: str) -> tuple[float, float]:
+    values = config[key]
+    if not isinstance(values, (list, tuple)) or len(values) != 2:
+        raise ValueError(f"{key} must contain exactly two values")
+    lower, upper = float(values[0]), float(values[1])
+    if lower > upper:
+        raise ValueError(f"{key} lower bound exceeds upper bound: {values}")
+    return lower, upper
+
+
+def _elastic_warp(gray: np.ndarray, config: dict[str, Any]) -> np.ndarray:
+    amplitude = random.uniform(*_range_pair(config, "elastic_amplitude"))
+    sigma = random.uniform(*_range_pair(config, "elastic_sigma"))
+    fields = []
+    for _ in range(2):
+        field = ndimage.gaussian_filter(
+            np.random.uniform(-1.0, 1.0, gray.shape),
+            sigma=sigma,
+            mode="reflect",
+        )
+        maximum = float(np.abs(field).max())
+        fields.append(field * (amplitude / maximum) if maximum > 1e-8 else field)
+    rows, columns = np.meshgrid(
+        np.arange(gray.shape[0], dtype=np.float32),
+        np.arange(gray.shape[1], dtype=np.float32),
+        indexing="ij",
+    )
+    warped = ndimage.map_coordinates(
+        gray,
+        [rows + fields[0], columns + fields[1]],
+        order=1,
+        mode="constant",
+        cval=255,
+    )
+    return np.clip(warped, 0, 255).astype(np.uint8)
+
+
+def _simplify_raster(gray: np.ndarray, config: dict[str, Any]) -> np.ndarray:
+    scale = random.uniform(*_range_pair(config, "simplify_scale"))
+    height, width = gray.shape
+    reduced = Image.fromarray(gray, mode="L").resize(
+        (max(8, round(width * scale)), max(8, round(height * scale))),
+        resample=Image.Resampling.BILINEAR,
+    )
+    return np.asarray(
+        reduced.resize((width, height), resample=Image.Resampling.BICUBIC),
+        dtype=np.uint8,
+    ).copy()
+
+
+def _vary_line_width(gray: np.ndarray) -> np.ndarray:
+    operation = random.choice(("thin", "thicken"))
+    radius = random.choice((1, 1, 2))
+    size = 2 * radius + 1
+    if operation == "thicken":
+        changed = ndimage.grey_erosion(gray, size=(size, size), mode="constant", cval=255)
+    else:
+        changed = ndimage.grey_dilation(gray, size=(size, size), mode="constant", cval=255)
+        # Do not let thinning erase most of a sparse drawing.
+        if np.count_nonzero(changed < 245) < 0.5 * max(np.count_nonzero(gray < 245), 1):
+            return gray
+    return changed.astype(np.uint8)
+
+
+def _segment_map(foreground: np.ndarray, maximum_length: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    skeleton = _zhang_suen_skeleton(foreground)
+    segment_labels = _skeleton_segment_labels(skeleton, maximum_length)
+    if not segment_labels.any():
+        empty = np.zeros(1, dtype=np.int64)
+        return segment_labels, empty, empty
+    _, nearest = ndimage.distance_transform_edt(segment_labels == 0, return_indices=True)
+    expanded = segment_labels[nearest[0], nearest[1]]
+    count = int(segment_labels.max())
+    areas = np.bincount(expanded[foreground], minlength=count + 1)
+    lengths = np.bincount(segment_labels.ravel(), minlength=count + 1)
+    return expanded, areas, lengths
+
+
+def _delete_one_segment(
+    gray: np.ndarray,
+    target_pixels: int,
+    maximum_area: int,
+    maximum_length: int,
+    small_only: bool,
+    small_maximum_length: int,
+) -> np.ndarray:
+    foreground = gray < 245
+    expanded, areas, lengths = _segment_map(foreground, maximum_length)
+    candidates = [
+        segment_id
+        for segment_id in range(1, len(areas))
+        if 0 < areas[segment_id] <= maximum_area
+        and np.count_nonzero(foreground) - areas[segment_id] >= target_pixels
+        and (
+            lengths[segment_id] <= small_maximum_length
+            if small_only
+            else lengths[segment_id] >= 8
+        )
+    ]
+    if candidates:
+        selected = random.choice(candidates)
+        gray[foreground & (expanded == selected)] = 255
+    return gray
+
+
+def _delete_local_gaps(
+    gray: np.ndarray,
+    target_pixels: int,
+    maximum_area: int,
+    config: dict[str, Any],
+) -> np.ndarray:
+    foreground = gray < 245
+    points = np.argwhere(_zhang_suen_skeleton(foreground))
+    if not len(points):
+        return gray
+    minimum_count, maximum_count = (int(value) for value in _range_pair(config, "gap_count"))
+    for _ in range(random.randint(minimum_count, maximum_count)):
+        center_row, center_column = points[np.random.randint(len(points))]
+        half_length = random.uniform(*_range_pair(config, "gap_length")) / 2.0
+        half_width = random.uniform(*_range_pair(config, "gap_width")) / 2.0
+        angle = random.uniform(0.0, math.pi)
+        radius = math.ceil(max(half_length, half_width))
+        row_start, row_stop = max(0, center_row - radius), min(gray.shape[0], center_row + radius + 1)
+        col_start, col_stop = max(0, center_column - radius), min(gray.shape[1], center_column + radius + 1)
+        rows, columns = np.meshgrid(
+            np.arange(row_start, row_stop) - center_row,
+            np.arange(col_start, col_stop) - center_column,
+            indexing="ij",
+        )
+        major = rows * math.sin(angle) + columns * math.cos(angle)
+        minor = rows * math.cos(angle) - columns * math.sin(angle)
+        local_gap = (major / max(half_length, 1e-6)) ** 2 + (minor / max(half_width, 1e-6)) ** 2 <= 1.0
+        foreground = gray < 245
+        candidate = np.zeros(gray.shape, dtype=bool)
+        candidate[row_start:row_stop, col_start:col_stop] = local_gap
+        candidate &= foreground
+        candidate_area = int(candidate.sum())
+        if (
+            0 < candidate_area <= maximum_area
+            and int(foreground.sum()) - candidate_area >= target_pixels
+        ):
+            gray[candidate] = 255
+    return gray
+
+
+def human_style_augment(
+    image: Image.Image,
+    config: dict[str, Any] | None = None,
+    target_keep: float | None = None,
+) -> tuple[Image.Image, float]:
+    """Create one human-style view with a shared 60--100% deletion budget."""
+    options = {**DEFAULT_HUMAN_STYLE_CONFIG, **(config or {})}
+    minimum_keep = float(options["minimum_keep"])
+    if not 0.0 < minimum_keep <= 1.0:
+        raise ValueError(f"minimum_keep must be in (0, 1], got {minimum_keep}")
+    if target_keep is None:
+        target_keep = random.uniform(minimum_keep, 1.0)
+    if not minimum_keep <= target_keep <= 1.0:
+        raise ValueError(f"target_keep must be in [{minimum_keep}, 1], got {target_keep}")
+
+    gray = np.asarray(image.convert("L"), dtype=np.uint8).copy()
+    if _probability(options, "elastic_probability"):
+        gray = _elastic_warp(gray, options)
+    if _probability(options, "simplify_probability"):
+        gray = _simplify_raster(gray, options)
+    if _probability(options, "width_probability"):
+        gray = _vary_line_width(gray)
+
+    reference_foreground = gray < 245
+    reference_pixels = int(reference_foreground.sum())
+    if reference_pixels == 0:
+        return Image.fromarray(gray, mode="L"), 1.0
+    target_pixels = max(
+        math.ceil(minimum_keep * reference_pixels),
+        math.floor(target_keep * reference_pixels),
+    )
+    maximum_structural_area = max(
+        1,
+        math.floor(float(options["maximum_structural_area_ratio"]) * reference_pixels),
+    )
+
+    if _probability(options, "small_structure_probability"):
+        gray = _delete_one_segment(
+            gray,
+            target_pixels,
+            maximum_structural_area,
+            int(options["maximum_segment_length"]),
+            small_only=True,
+            small_maximum_length=int(options["small_segment_maximum_length"]),
+        )
+    if _probability(options, "segment_probability"):
+        gray = _delete_one_segment(
+            gray,
+            target_pixels,
+            maximum_structural_area,
+            int(options["maximum_segment_length"]),
+            small_only=False,
+            small_maximum_length=int(options["small_segment_maximum_length"]),
+        )
+    if _probability(options, "gap_probability"):
+        gray = _delete_local_gaps(
+            gray,
+            target_pixels,
+            maximum_structural_area,
+            options,
+        )
+
+    # Pixel-level deletion fills the remainder of the same completeness
+    # budget, rather than stacking another independent 40% removal on top.
+    foreground = gray < 245
+    delete_count = max(0, int(foreground.sum()) - target_pixels)
+    if delete_count:
+        foreground_indices = np.flatnonzero(foreground)
+        priorities = np.random.random(len(foreground_indices))
+        selected = foreground_indices[np.argpartition(priorities, -delete_count)[-delete_count:]]
+        gray.ravel()[selected] = 255
+    actual_keep = np.count_nonzero(gray < 245) / reference_pixels
+    if actual_keep + 1e-8 < minimum_keep:
+        raise RuntimeError(f"human-style augmentation violated keep floor: {actual_keep:.4f}")
+    return Image.fromarray(gray, mode="L"), float(actual_keep)
+
+
+def paired_train_sketch_transform(
+    first: Image.Image,
+    second: Image.Image,
+    image_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the exact same global affine and crop to two style views."""
+    affine_parameters = RandomAffine.get_params(
+        degrees=(-30.0, 30.0),
+        translate=(0.3, 0.3),
+        scale_ranges=(1.0, 2.0),
+        shears=(-30.0, 30.0, -30.0, 30.0),
+        img_size=list(first.size),
+    )
+
+    def affine(image: Image.Image) -> Image.Image:
+        return transform_functional.affine(
+            image,
+            *affine_parameters,
+            interpolation=InterpolationMode.BICUBIC,
+            fill=255,
+        )
+
+    first, second = affine(first), affine(second)
+    crop_parameters = RandomResizedCrop.get_params(
+        first,
+        scale=(0.8, 1.0),
+        ratio=(3.0 / 4.0, 4.0 / 3.0),
+    )
+
+    def finish(image: Image.Image) -> torch.Tensor:
+        image = transform_functional.resized_crop(
+            image,
+            *crop_parameters,
+            size=[image_size, image_size],
+            interpolation=InterpolationMode.BICUBIC,
+        ).convert("RGB")
+        return CLIP_NORMALIZE(transform_functional.to_tensor(image))
+
+    return finish(first), finish(second)
+
+
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     with Path(path).open() as handle:
         return [json.loads(line) for line in handle if line.strip()]
@@ -283,6 +574,8 @@ class CaptionSketchDataset(Dataset):
         use_human_sketch: bool = False,
         query_dropout: float = 0.2,
         sketch_dropout_mode: str = "pixel",
+        sketch_views: int = 1,
+        human_style_config: dict[str, Any] | None = None,
     ) -> None:
         self.records = read_jsonl(manifest)
         self.pairs = [
@@ -293,9 +586,16 @@ class CaptionSketchDataset(Dataset):
         self.training = training
         self.use_human_sketch = use_human_sketch
         self.query_dropout = query_dropout if training else 0.0
-        if sketch_dropout_mode not in {"pixel", "segment"}:
+        if sketch_dropout_mode not in {"pixel", "segment", "human_style"}:
             raise ValueError(f"unsupported sketch_dropout_mode: {sketch_dropout_mode}")
+        if sketch_views not in {1, 2}:
+            raise ValueError(f"sketch_views must be 1 or 2, got {sketch_views}")
+        if sketch_dropout_mode == "human_style" and (not training or sketch_views != 2):
+            raise ValueError("human_style mode requires training=True and sketch_views=2")
         self.sketch_dropout_mode = sketch_dropout_mode
+        self.sketch_views = sketch_views
+        self.human_style_config = human_style_config or {}
+        self.image_size = image_size
         if training:
             self.image_transform = train_image_transform(image_size)
             self.sketch_transform = train_sketch_transform(image_size)
@@ -316,32 +616,67 @@ class CaptionSketchDataset(Dataset):
         if not sketch_path:
             raise RuntimeError(f"record {record['coco_id']} has no {sketch_key}")
         sketch = Image.open(sketch_path).convert("L")
+        second_sketch = None
+        sketch_keep_ratio = 1.0
+        second_sketch_keep_ratio = 1.0
         if self.training:
             if self.sketch_dropout_mode == "pixel":
                 sketch = stroke_dropout(sketch)
-            else:
+            elif self.sketch_dropout_mode == "segment":
                 sketch = stroke_segment_dropout(sketch)
+            else:
+                minimum_keep = float(
+                    self.human_style_config.get(
+                        "minimum_keep",
+                        DEFAULT_HUMAN_STYLE_CONFIG["minimum_keep"],
+                    )
+                )
+                target_keep = random.uniform(minimum_keep, 1.0)
+                original_sketch = sketch
+                sketch, sketch_keep_ratio = human_style_augment(
+                    original_sketch,
+                    self.human_style_config,
+                    target_keep=target_keep,
+                )
+                second_sketch, second_sketch_keep_ratio = human_style_augment(
+                    original_sketch,
+                    self.human_style_config,
+                    target_keep=target_keep,
+                )
 
         drop_draw = random.random()
         drop_sketch = self.training and drop_draw < self.query_dropout / 2
         drop_text = self.training and self.query_dropout / 2 <= drop_draw < self.query_dropout
         if drop_sketch:
             sketch = Image.new("L", sketch.size, color=255)
+            if second_sketch is not None:
+                second_sketch = Image.new("L", second_sketch.size, color=255)
         query_caption = "" if drop_text else caption
 
         labels = torch.zeros(90, dtype=torch.float32)
         for category_id in record["category_ids"]:
             labels[category_id - 1] = 1.0
 
-        return {
+        item = {
             "image": self.image_transform(image),
-            "sketch": self.sketch_transform(sketch),
             "text_tokens": tokenize(query_caption)[0],
             "caption_tokens": tokenize(caption)[0],
             "labels": labels,
             "coco_id": int(record["coco_id"]),
             "caption": caption,
+            "sketch_present": not drop_sketch,
         }
+        if second_sketch is None:
+            item["sketch"] = self.sketch_transform(sketch)
+        else:
+            item["sketch"], item["sketch_view2"] = paired_train_sketch_transform(
+                sketch,
+                second_sketch,
+                self.image_size,
+            )
+            item["sketch_keep_ratio"] = sketch_keep_ratio
+            item["sketch_view2_keep_ratio"] = second_sketch_keep_ratio
+        return item
 
 
 class DistributedUniqueImageBatchSampler(Sampler[list[int]]):

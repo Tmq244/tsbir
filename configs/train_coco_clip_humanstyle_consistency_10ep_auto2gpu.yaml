@@ -1,0 +1,91 @@
+experiment:
+  name: taskformer_coco_clip_humanstyle_consistency_10ep_auto2gpu
+  seed: 2026
+  output_dir: outputs/taskformer_coco_clip_humanstyle_consistency_10ep_auto2gpu
+
+data:
+  root: data
+  train_manifest: data/processed/manifests/train.jsonl
+  val_manifest: data/processed/manifests/val.jsonl
+  test_manifest: data/processed/manifests/test.jsonl
+  caption_sampling: all
+  train_pairs_per_epoch: 566747
+  image_size: 224
+  workers_per_gpu: 6
+  sketch_dropout_mode: human_style
+  sketch_views: 2
+  human_style:
+    minimum_keep: 0.60
+    width_probability: 0.35
+    elastic_probability: 0.30
+    elastic_amplitude: [1.0, 4.0]
+    elastic_sigma: [8.0, 16.0]
+    gap_probability: 0.30
+    gap_count: [1, 4]
+    gap_length: [4.0, 16.0]
+    gap_width: [2.0, 6.0]
+    simplify_probability: 0.20
+    simplify_scale: [0.55, 0.85]
+    small_structure_probability: 0.15
+    small_segment_maximum_length: 24
+    segment_probability: 0.10
+    maximum_segment_length: 64
+    maximum_structural_area_ratio: 0.10
+
+model:
+  architecture: ViT-B-16
+  embed_dim: 512
+  weight_sharing: true
+  feature_fusion: avg
+  normalize_fused_query: true
+  num_classes: 90
+  decoder_depth: 6
+  decoder_heads: 8
+  decoder_max_length: 77
+  init: clip_pretrained
+  checkpoint: model/ViT-B-16.pt
+  load_optimizer: false
+
+loss:
+  contrastive_weight: 100.0
+  classification_weight: 10.0
+  decoder_weight: 1.0
+  consistency_weight: 1.0
+  asl_gamma_negative: 4.0
+  asl_gamma_positive: 1.0
+  asl_clip: 0.05
+  gather_contrastive_features: true
+
+train:
+  epochs: 10
+  batch_size_per_gpu: 96
+  expected_world_size: 2
+  global_batch_size: 192
+  effective_batch_size: 192
+  eval_batch_size_per_gpu: 128
+  gradient_accumulation_steps: 1
+  precision: bf16
+  # The second sketch view adds a third ViT pass. Checkpointing is an
+  # implementation-only memory optimization and leaves the objective intact.
+  gradient_checkpointing: true
+  gradient_clip_norm: 1.0
+  optimizer: adamw
+  learning_rate: 1.0e-5
+  min_learning_rate: 1.0e-6
+  warmup_steps: 1000
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.98
+  eps: 1.0e-6
+  scheduler: cosine
+  save_last: true
+  save_epoch_weights: true
+  selection_metric: last_epoch
+
+distributed:
+  enabled: true
+  backend: nccl
+  devices: [auto, auto]
+  nproc_per_node: 2
+  find_unused_parameters: false
+  broadcast_buffers: false
